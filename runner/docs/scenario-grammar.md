@@ -1,0 +1,692 @@
+# Scenario grammar reference
+
+This document is the canonical reference for the YAML grammar `mirroir-run`
+parses. Every `SkillStep` variant is listed below with the YAML shape and its
+dispatch target (process / http / web / ios / oracle), or the plan-time
+refusal for a step no target can run. Which run path
+exercises a step end-to-end depends on the invocation flag
+(`--sample` / `--validate` / `--run-scenario` / `--emit playwright` /
+`--diff-text`).
+
+Source of truth: `runner/src/parser/step.rs`. Run `cargo doc --open` from
+`runner/` for the auto-generated rustdoc; this file gives the prose view
+keyed by scenario-author concerns.
+
+## Top-level shape
+
+```yaml
+version: 1                  # schema major; mismatch is a hard load error
+name: "scenario name"
+description: "free-form prose"   # optional
+app: "spring-boot-chat"          # optional; references SAMPLE.md slug
+tags: ["smoke", "streaming"]     # optional
+requires_clean_boot: true        # optional; in a boot_once sample, boot a server for this scenario alone
+drift:                           # optional; the scenario layer of the drift hierarchy
+  fingerprint_similarity:    { min: 0.90 }
+  judge_score_swing:         { max_delta: 0.05 }
+  response_levenshtein_pct:  { max: 0.20 }
+  step_latency_pct_increase: { max: 0.25 }
+steps:
+  - <step>
+  - <step>
+```
+
+`${VAR}` and `${VAR:-default}` substitution runs over the raw YAML *before*
+parsing. POSIX semantics — unset or empty variables resolve to the default
+when one is given, else to the empty string.
+
+In `--sample` mode the runner additionally exposes `${MIRROIR_SAMPLE_DIR}`
+so scenarios can reference baseline files relative to the sample directory.
+
+`requires_clean_boot: true` matters only in a `boot_once` sample: the shared
+server is stopped, this scenario runs against a server booted for it alone, and
+the scenarios after it get a freshly booted shared server. A destructive flow or
+a state reset neither inherits the shared server's state nor leaks its own.
+
+The `drift:` block declares only the metrics this scenario wants to own; every
+other metric falls through to the sample's `APP.md` `drift_defaults:` block and
+then to the `drift-defaults.yaml` on the search path. A metric no layer
+declares fails the run by name rather than defaulting — see the README's
+"The three verdicts" section.
+
+### Versioning
+
+Every artifact the runner loads carries a root `version:` — scenarios,
+`SAMPLE.md`, `mirroir.yaml`, `mirroir.local.yaml`, `mirroir.lock`,
+`archetype.md`, `drift-defaults.yaml`, `oracles/profiles.yaml`, the `APP.md`
+block read for `drift_defaults:`, `.harness/last-green.json`, and the compose
+cache's `.compose-manifest.json`. One seam gates them all
+(`runner/src/parser/version.rs`):
+
+- `version: 1` (an integer) is the canonical form and means major 1, minor 0.
+  A quoted `"MAJOR.MINOR"` string such as `"1.2"` carries a minor. A bare
+  YAML float (`1.2`) is refused, because `1.10` would read back as `1.1`.
+- The binary supports majors `1..=1` for every artifact. Any other major is a
+  hard `UnsupportedVersion` error naming the artifact, the file, the version
+  found, and the supported range. The version is read *before* the rest of
+  the file, so a newer major that also adds keys reports the version, not the
+  keys.
+- At a minor this binary knows (`1`, `"1.0"`), a key the schema does not
+  define is an `UnknownFields` error that lists every unknown key by its
+  dotted path (`steps.2.tap.lable`) — nested keys included. Typos fail loudly.
+- At a newer minor (`"1.1"` read by a binary that knows `1.0`), unknown keys
+  are what that minor added: they are ignored and logged as a warning.
+- `APP.md` shares its root with other tools (`app`, `archetype`, `locale`, …),
+  so its unknown top-level keys are not the runner's to judge; keys under
+  `drift_defaults:` are still checked.
+- The compose cache is rebuilt, not refused, when its manifest is from an
+  unsupported major.
+- The run summary the runner *writes* and the Playwright report JSON it reads
+  are not gated: the first is never loaded back, the second is Playwright's
+  shape and carries no version key.
+
+---
+
+## Process target steps (dispatched via `tokio::process`)
+
+### `spawn`
+
+Start a subprocess. `command:` or `from: SAMPLE.md` is required; inline values
+win over manifest values when both are present.
+
+```yaml
+- spawn:
+    id: server                       # required; later kill/assert_log/wait_port reference this id
+    command: "java -jar foo.jar"     # required unless `from:` is set
+    from: SAMPLE.md                  # optional; pulls boot.command / cwd / env / timeout_s from SAMPLE.md
+    cwd: "samples/foo"               # optional; resolved relative to the sample dir in --sample mode
+    env:                             # optional; merged with manifest env (inline wins per-key)
+      SPRING_PROFILES_ACTIVE: ci
+    timeout_s: 60                    # optional ceiling on subprocess runtime
+    expect_exit: 0                   # optional required exit code (post-mortem check)
+    capture_stdout: var_name         # optional; capture stdout into a runner variable
+```
+
+Errors: `DuplicateProcessId`, `SpawnMissingSource`, `ProcessSpawn`.
+
+### `kill`
+
+Terminate a previously-spawned subprocess. Graceful: waits `grace_s` for
+natural exit, then SIGTERM, then SIGKILL.
+
+```yaml
+- kill: { id: server, grace_s: 5 }   # cleanup: optional shell command after exit
+```
+
+Errors: `UnknownProcess`, `ProcessControl`.
+
+### `wait_port`
+
+Block until a TCP port reaches the expected state. Both loopback addresses are
+probed — IPv4 `127.0.0.1` **and** IPv6 `[::1]` — so dev servers that bind only
+one are detected either way (Vite, for example, binds `[::1]` when told to
+listen on `localhost`). `expect: open` resolves once either connects; `expect:
+closed` once both refuse.
+
+```yaml
+- wait_port: { port: 8081, timeout_s: 30, expect: open }   # expect: open|closed
+```
+
+Errors: `WaitPortTimeout`.
+
+### `assert_log`
+
+Auto-polling regex match against the subprocess's captured stdout+stderr.
+Mirrors Playwright's "expect-with-retry" model — polls every 100 ms up to
+`timeout_s` (default 5 s).
+
+```yaml
+- assert_log:
+    id: server
+    pattern: 'Started ServerApplication'
+    flags: "i"           # optional: i (case-insensitive), m, s, x, U
+    timeout_s: 10        # optional
+```
+
+Errors: `UnknownProcess`, `RegexFlags`, `RegexCompile`, `LogAssertion`.
+
+### `assert_log_clean`
+
+Single-shot scan: fail if any `deny` pattern matches a line that no `allow`
+pattern also matches.
+
+```yaml
+- assert_log_clean:
+    id: server
+    deny:
+      - { pattern: '^\s*ERROR\b', flags: "im" }
+      - { pattern: 'BeanInstantiationException' }
+    allow:
+      - { pattern: 'Disabled retry on ERROR\.RATE_LIMIT' }
+```
+
+---
+
+## HTTP target step (dispatched via `reqwest`)
+
+### `http`
+
+REST probe with optional status + body substring assertions.
+
+```yaml
+- http:
+    method: GET                              # GET|POST|PUT|DELETE|HEAD|PATCH
+    url: "http://127.0.0.1:8081/api/info"
+    expect_status: 200                       # optional
+    expect_body_contains:                    # optional list of substrings
+      - "webtransport"
+      - "websocket"
+    timeout_s: 30                            # optional per-request timeout (default 30)
+```
+
+A `file://` URL reads a local file instead, for filesystem assertions: `expect_body_contains`
+applies to the file's contents. Only `GET` reads a file, and a file has no status, so
+`expect_status` is refused by name.
+
+```yaml
+- http:
+    method: GET
+    url: "file:///tmp/export/report.csv"
+    expect_body_contains:
+      - "12 rows"
+```
+
+Errors (`HttpError`): `Client`, `Tls`, `Request`, `StatusMismatch`, `BodyRead`, `BodyMismatch`,
+and for `file://`: `FileUrl`, `FileRead` (missing or unreadable file, naming its path),
+`FileStatus`, `FileMethod`.
+
+---
+
+## Web target steps (dispatched via Playwright)
+
+A scenario compiles to **exactly one** `npx playwright test` invocation. Every
+web step of the scenario lands in that one spec, in file order; runner-side
+steps before it are pre-hooks and runner-side steps after it are post-hooks.
+
+That model requires the web steps to form **one adjacent run**. A scenario that
+resumes web work after a runner-side step (`web → http → web`) is rejected by
+`--validate` and by the run, naming the offending step index
+(`BlockNotContiguous`). The shape cannot mean what it reads: the trailing
+web steps would execute in the same browser context as the leading ones,
+before the step the file puts between them. A second `target:` to force a
+second invocation is worse — a fresh context silently discards cookies,
+`localStorage`, auth, in-memory JS state and open WebSockets. Move the
+runner-side step before or after the web run instead.
+
+`remember:` is exempt: it records a note and drives nothing, so it is
+transparent to the web run and may sit anywhere outside an `ios` block — see
+[Annotation step](#annotation-step).
+
+### `target`
+
+Opens a device block. The block carries the device steps that follow it and
+ends at the first runner-side step; it runs as **one invocation** of its
+surface's engine. A scenario opens at most one block per surface, and a device
+step outside its block is refused — both at `--validate` and at run time,
+because a second block of one surface would start a fresh session and silently
+discard the first one's state.
+
+```yaml
+- target:
+    kind: web                                       # compiled to one Playwright invocation
+    browsers: [chrome, firefox, webkit]             # default [chrome]
+    url: "http://localhost:8081/"                   # initial navigation
+
+- target: { kind: ios, app: "Safari" }              # handed, as one block, to `mirroir-mcp test`
+```
+
+Each browser runs as its own Playwright project, and a failure names the
+browser it happened in (`[firefox] checkout: Timeout 5000ms exceeded`). A
+`judge:`, `cross_surface:` or `measure:` reads one captured value per run, so a
+scenario that declares one and lists more than one browser is refused by name
+(`MultiBrowserCapture`): run it in one browser, or split it per browser.
+
+| `kind` | Engine | Where it runs |
+|---|---|---|
+| `web` | Playwright (`npx playwright test`) | any host |
+| `ios` | `mirroir-mcp test` against iPhone Mirroring | macOS only — refused by name elsewhere (`IosNeedsMacosHost`) |
+| `macos`, `process`, `http` | none — refused by name | a `macos` window is driven by `mirroir-mcp test` directly; subprocess and REST work needs no `target:`, its `spawn:` / `kill:` / `http:` steps dispatch in Rust |
+
+An `ios` block carries the interaction verbs a web block does plus the
+device-level ones only a phone has — `launch:`, `home:`, `shake:`,
+`reset_app:`, `set_network:`. The runner writes the block in mirroir-mcp's
+one-step-per-line dialect (`target/mirroir-ios/<scenario>/ios-block.yaml`) and
+reads back the Playwright-JSON-shaped report `mirroir-mcp test --report-json`
+writes, through the same ingest as a web block. A web-only option in an iOS
+block (`last:`, `into:`, `contains:`, a per-step `timeout_s:` on `tap:` or an
+assert) is refused by name (`IosError::NotExpressible`), never dropped. An
+AI-only step (`remember:`) between two steps of an `ios` block is refused at
+plan time (`IosError::AiOnlyStepInBlock`): `mirroir-mcp test` cannot evaluate
+it and would fail the block on it. Place it after the block's last device step.
+The AI-only kinds are pinned on both sides by
+`src/target/fixtures/ai-only-step-kinds.json`.
+`mirroir-mcp` is found through `MIRROIR_MCP_BIN`, else `PATH`. The block runs
+from its scratch workspace, so the runner hands its `--skills` /
+`$MIRROIR_SKILLS` checkout to `mirroir-mcp test` as an absolute
+`MIRROIR_SKILLS`: the block's pattern loaders (text cleanup, screen recipes,
+APP.md) read the same checkout as the runner's threshold layers.
+
+Each `mirroir-mcp test` run is bounded. Every step of the block earns an
+allowance — 30 s by default, the same ceiling a web step gets — or its own
+longer ceiling (a `wait_for:` `timeout_s`, a `measure:` `max_seconds`, one
+allowance per `scroll_to:` attempt, a `scene:`'s `max_seconds` plus one
+allowance), and the final-screen capture earns one more. Past that budget the child's whole process group is killed and the block
+fails with `IosError::BlockTimeout`, naming the elapsed time, the budget and
+the stderr tail. `MIRROIR_IOS_STEP_ALLOWANCE_S` overrides the per-step
+allowance in whole seconds.
+
+### `tap`, `type`, `wait_for`, `assert_visible`, `assert_not_visible`
+
+Click a labelled element / write text into one / wait for label / assert
+visibility. A label resolves in three ways, in priority order:
+
+1. **Raw CSS / locator passthrough** — label starts with one of `[ # . : > *`
+   → `page.locator(label)`. Use for form fields and attribute selectors:
+   `[name="email"]`, `[placeholder^="Type a message"]`, `.message--assistant`.
+2. **Playwright locator-engine passthrough** — label starts with `role=`,
+   `text=`, `xpath=`, `css=`, `id=`, or `data-testid=` → `page.locator(label)`.
+   This is the workhorse for accessible apps (ARIA role + accessible name):
+   `role=button[name="Send message"]`, `role=heading[name="Settings"]`.
+3. **Otherwise** → one `.or()` union in Playwright's own locator priority:
+   `getByRole('button', { name, exact })` → `getByRole('link', …)` →
+   `getByLabel` → `getByPlaceholder` → `[data-test="<label>"]` →
+   `getByText(<label>, { exact: true })`. Matching two different elements in
+   that union is a strict-mode error, which is the intended signal: an
+   ambiguous label is an authoring bug.
+
+Each of the four verbs takes a string shorthand or a record. The record adds
+`last: true` (select the final match of an ambiguous label instead of
+requiring a unique one) and `timeout_s` (per-step ceiling; the emitter's
+default is 30s). `assert_visible` / `assert_not_visible` also take
+`contains:`, which upgrades the assertion from presence to content
+(`toContainText`, negated for `assert_not_visible`).
+
+`type:` compiles to `locator.fill()` — it clears the field and writes the
+text, so a re-run against a pre-filled form produces the same value an empty
+one did. The shorthand writes into the element the closest preceding `tap:` /
+`long_press:` touched; `into:` names the target explicitly. With neither, it
+writes into whatever holds focus (`page.locator(":focus")`).
+
+```yaml
+- tap: "role=button[name=\"Send message\"]"          # role engine (preferred for real apps)
+- tap: "[name=\"email\"]"                            # raw CSS for inputs
+- type: "hello mirroir"                             # fills the element the tap above touched
+- type: { text: "hello", into: "prompt-input", timeout_s: 5 }
+- tap: { label: "message-agent", last: true }       # the newest bubble, not a unique one
+- wait_for: { label: "text=claude-opus", timeout_s: 60 }  # text= = substring; survives version bumps
+- assert_visible: "role=heading[name=\"Directory listing for /\"]"
+- assert_visible: { label: "message-agent", contains: "4", last: true }
+- assert_not_visible: "Error toast"
+- assert_not_visible: { label: "status", contains: "Error" }
+```
+
+Selector gotchas (each surfaced by real onboarding):
+
+- **`role=…[name="X"]` matches the accessible name EXACTLY** (trimmed,
+  case-insensitive) — not a substring. It won't match an element whose
+  accessible name is a longer concatenation (e.g. a card `<button>` whose name
+  is title + description). Target the unique inner text node instead (bare
+  text → `getByText`, which the click bubbles up), or use `text=`.
+- **`text=` is a substring match**; bare text (no prefix) is **exact** via
+  `getByText`. A label with a trailing count/badge ("Pending Users (3)") needs
+  `text=Pending Users`, not the bare exact form.
+- **Duplicate matches** (label resolves to >1 element → Playwright strict-mode
+  error) → append `>> nth=0`: `role=button[name="Create Group"] >> nth=0`.
+- Trust the accessible name from a browser **accessibility tree** snapshot, not
+  `el.textContent` — they differ (e.g. a tab reads `Pending 3` with a space in
+  the a11y name even when `textContent` is `Pending3`).
+
+Every compiled spec also installs two browser-side invariants no scenario has
+to ask for: an uncaught exception (`pageerror`) or a failed response for a
+resource the page depends on (`document`, `script`, `stylesheet`, `fetch`,
+`xhr`) fails the test. They are the browser counterpart of `assert_log_clean`,
+and they ride out on the `mirroir-captures` attachment as `page_errors` and
+`failed_requests` so the failure carries the detail.
+
+### `press_key`
+
+Key combos with mirroir-style modifier names (mapped to Playwright's
+`Meta+Shift+Enter` form at compile time).
+
+```yaml
+- press_key: { key: "return", modifiers: ["command", "shift"] }
+```
+
+### `swipe`, `scroll_to`, `long_press`, `drag`
+
+```yaml
+- swipe: "up"                                       # up|down|left|right; parks the pointer, then page.mouse.wheel
+- scroll_to: "Welcome"                              # looks further down the page; { label, direction, max_scrolls } names another
+- long_press: { label: "Send", duration_ms: 1000 }
+- drag: { from: "card-1", to: "drop-zone" }
+```
+
+### `screenshot`, `open_url`
+
+```yaml
+- screenshot: "after-send"                          # writes screenshots/after-send.png
+- open_url: "https://example.com/profile"
+```
+
+`screenshot:` shoots the live page, so it is a web step wherever it reads: one
+placed after a `kill:` is rejected as a split web run, because by then there is
+no page worth shooting.
+
+---
+
+## Annotation step
+
+### `remember`
+
+Records the author's observation on the run. It needs no browser, no page and
+no runner-side state, which is why it is neither a web step nor a runner-side
+step: it never opens a web run and never ends one, so it is legal at any
+position — including after the `kill:` that tears the server down.
+
+```yaml
+- remember: "Verified streaming reply over preferred transport"
+```
+
+Inside a web run it rides along and reaches the emitted spec as a comment at
+its own position. Inside an `ios` block it is refused at plan time
+(`IosError::AiOnlyStepInBlock`), because `mirroir-mcp test` cannot evaluate it.
+Anywhere else the runner dispatches it and logs the note.
+Either way it asserts nothing, so a scenario whose only step is a note still
+fails with `ScenarioNothingEvaluated`.
+
+---
+
+## Device-level steps (inside an `ios` block)
+
+Inside an `ios` block these run on the phone, through `mirroir-mcp test`.
+Anywhere else there is no device to drive, so the plan refuses the scenario
+before anything runs: a phone-only step before any `ios` block opens is
+`IosError::DeviceStepOutsideIosBlock`, and one after the `ios` block has ended
+is `RunnerError::BlockNotContiguous`. Move the step inside the block, after its
+`target:`.
+
+```yaml
+- launch: "Expo Go"
+- home: null
+- shake: null
+- reset_app: "com.example.app"
+- set_network: "airplane_on"
+```
+
+---
+
+## `measure`
+
+Times an action against a visibility outcome. Compiles into the scenario's
+Playwright spec: the action runs, the clock stops when `until` becomes visible,
+and the elapsed milliseconds ride out on the `mirroir-captures` attachment. The
+Rust post-hook enforces `max_seconds` against that number
+(`MeasureBudgetExceeded`), and fails the scenario when the invocation recorded
+no timing at all (`MeasureNotCaptured`).
+
+```yaml
+- measure:
+    name: "first_token_latency"                     # key the latency is filed under
+    action: "tap:send"                              # <verb>:<value> — tap|type|press_key|swipe|open_url|wait_visible
+    until: "streaming-caret"                        # stops the clock when this becomes visible
+    max_seconds: 5                                  # optional ceiling; also the wait timeout
+```
+
+`until` is optional when the action is itself a waiting verb. `wait_for` and
+`wait_visible` are self-terminating, so the action's own label stops the clock
+and there is nothing to wait for afterwards — the step times how long that label
+takes to appear:
+
+```yaml
+- measure:
+    name: "first_token_latency"
+    action: "wait_visible: streaming-caret"         # the wait IS the measured operation
+    max_seconds: 5
+```
+
+Any other verb omitting `until` is a compile-time `PlaywrightError::Unsupported`: a
+`tap` has nothing to stop the clock, and guessing a stop condition would time
+the wrong thing. A verb with no web equivalent is likewise a compile-time
+failure, not a silently skipped step.
+
+`max_seconds` is an absolute budget; the *relative* question — did this get
+slower than last time? — is the `step_latency_pct_increase` drift metric, which
+compares the recorded latency against `.harness/last-green.json`. Blowing the
+budget is a FAIL; creeping past the increase ceiling is a DRIFT. The runner asks
+both.
+
+---
+
+## `scene`
+
+Runs a kind:game skill frame by frame under a hard budget. Only inside an
+`ios` block: `mirroir-mcp test` resolves the skill, shows each frame to the
+vision model, posts the one touch it picks, and stops when the skill's success
+or fail predicate shows or the budget runs out. Every budget field is required
+and positive, and an unknown key is a parse error.
+
+```yaml
+- scene: { skill: scene-frames-reach, budget: { max_frames: 6, max_tokens: 150000, max_seconds: 60 } }
+```
+
+| Scene verdict | Run |
+|---|---|
+| `pass` — the success predicate showed | passes; its total tokens and frames-to-predicate feed `scene_tokens_pct_increase` / `scene_frames_pct_increase`, compared only against green runs of the same model |
+| `fail` — the fail predicate showed, a frame could not be read, priced or acted on, or the move picker failed (`decider_failed`) | FAIL, exit 1 (`SceneError::Failed`) |
+| `inconclusive` — the budget ran out first | FAIL, exit **66** (`SceneError::Inconclusive`) unless another failure exits 1 |
+
+A block that passes with no report for one of its scenes fails
+(`SceneError::NotReported`). A scene is never compiled: a block holding one
+neither records nor compares a `<scenario>.compiled.json` screen reference.
+
+### `decider` — the move picker
+
+A skill that declares `decider: required` (a board game, say) has the model
+only *read* each frame into the text its Objective defines, such as a FEN; an
+external program picks the move. That program is named by the scenario's
+`decider:` key, never by a skill, so the same skill runs against any engine:
+
+```yaml
+- scene: { skill: board-reach, budget: { max_frames: 4, max_tokens: 80000, max_seconds: 120 }, decider: "./tools/sf.sh --depth 12" }
+```
+
+- The value is a command line: a program, then its arguments, split on
+  whitespace with no shell. A blank value is a parse error
+  (`SceneError::BlankDecider`).
+- A program written as a relative path (holding a `/`, not starting with one)
+  is resolved against the **scenario file's directory**, `.` components
+  dropped; an absolute path, and a bare name looked up on `PATH`, are kept.
+  The arguments cross as written.
+- The block line carries it double-quoted: `scene: { skill: "board-reach",
+  max_frames: 4, max_tokens: 80000, max_seconds: 120, decider:
+  "/abs/scenarios/tools/sf.sh --depth 12" }`. mirroir-mcp unescapes nothing in
+  a quoted value, so a decider holding `"`, `\` or a line break is refused
+  (`IosError::NotExpressible`).
+- Without the key, mirroir-mcp falls back to `MIRROIR_SCENE_DECIDER`. A
+  `decider: required` skill with neither, and a decider on a skill that does
+  not require one, are refused before the block's first step.
+
+Each frame the picker gets one JSON object on stdin (`run_id`, `frame`,
+`reading`, `ocr`, `controls`) and prints one action: a `tap`/`hold` control, a
+`drag` control with a `direction`, a `grid` control with 1 to 4 `cells`
+(`"e2"`: column letter from the left, row number from the bottom), or
+`"control": "none"` to wait a frame without touching. The skill side — the
+`- board: grid 8x8 from x,y to x,y` control line, cell naming, and the action
+shapes — is documented in
+[`docs/skills-marketplace.md#scenes`](../../docs/skills-marketplace.md#scenes).
+
+### The scene report
+
+Each scene's entry in the block's captures carries its verdict and reason,
+frames, tokens, seconds, model, rejected replies, evidence directory, and two
+counters that are always present:
+
+| Key | Meaning |
+|---|---|
+| `waits` | frames whose action was `none` |
+| `decider_calls` | times the move picker was asked for an action; `0` with no decider |
+
+The reason `decider_failed` — the picker exited non-zero, printed no valid
+action, named a control the skill does not declare, or timed out with time
+still left — has verdict `fail`: exit 1 (`SceneError::Failed`), never the
+inconclusive 66. A picker timeout at the scene's deadline is `max_seconds`.
+
+---
+
+## Control-flow steps
+
+### `condition`
+
+Branch on visibility of a label. The grammar parses it, but no executor in
+the runner checks `if_visible`, so neither branch could run: the plan refuses
+any scenario holding one with `RunnerError::ConditionHasNoEvaluator`. Write the
+branch the run must take as plain steps.
+
+```yaml
+- condition:
+    if_visible: "Invalid credentials"
+    then:
+      - tap: "Sign Up"
+    else:
+      - wait_for: "Welcome"
+```
+
+### `report`
+
+Declare the scenario's verdict. All four forms are honored:
+
+| Form | Effect |
+|---|---|
+| `pass`, `cross_surface_pass` | the step counts as an evaluation and the run stays green |
+| `fail` | `RunnerError::ScenarioReportedFailure` — the run exits 1 |
+| `drift` | files a `declared` candidate on the scenario's drift session; the run exits 65 and the remaining post-hooks still execute |
+
+```yaml
+- report: pass                                       # or fail | drift | cross_surface_pass
+- report: { verdict: drift }
+```
+
+The JSON report artifact is separate and always written: `--report` (default
+`mirroir-run-report.json`) carries the run summary regardless of this step.
+
+---
+
+## Oracle steps
+
+### `judge`
+
+LLM scoring of a captured response. See [judge-profiles.md](judge-profiles.md)
+for the profile registry.
+
+```yaml
+- judge:
+    profile: byte-stable                             # fast-ci | byte-stable | cheap-local
+    user_prompt_template_hash: "sha256:abc123…"      # pinned; verified every run, hard-fails on mismatch
+    response_selector: "[data-test=reply]"           # scraped from the live page into the captures attachment
+    pass_threshold: 0.85
+    pass_threshold_tolerance: 0.05                   # optional; effective = threshold - tolerance
+    expected_signal: "summary covers transports"     # human-readable; not load-bearing
+    response_text: "…"                               # optional: overrides the scrape
+    response_file: "${MIRROIR_SAMPLE_DIR}/captured.txt"   # optional: overrides the scrape
+    response_drift:                                  # optional; the innermost drift layer
+      max_levenshtein_pct: 0.15                      # overrides response_levenshtein_pct for this step
+    drift_baseline_file: "${MIRROIR_SAMPLE_DIR}/baselines/judge.txt"   # optional; overrides last-green
+```
+
+The response resolves in this order: `response_text`, then `response_file`,
+then the page. A judge step placed after the scenario's web run compiles a
+scrape of `response_selector` at its own position in the flow; the text is
+filed under the step's index in the `mirroir-captures` attachment and read back
+by the post-hook. A judge step with none of the three available fails with
+`OracleError::Decode` naming the selector it wanted.
+
+Every judge step feeds the scenario's drift session: its score and its response
+are recorded in `.harness/last-green.json` on a green run, and compared against
+that store on the next one. A score below `pass_threshold - tolerance` is a
+FAIL; a score that held while the wording moved is a DRIFT, and the run
+continues so `kill:` and `assert_log_clean:` still execute.
+`drift_baseline_file` names the text this step drifts from instead of the
+store; `response_drift.max_levenshtein_pct` is the innermost layer of the
+threshold hierarchy for `response_levenshtein_pct`. Under `mirroir-run accept`
+the baseline file is rewritten with what the run judged rather than read — see
+[drift-and-accept.md](drift-and-accept.md).
+
+Errors: `OracleError::{UnknownProfile, MissingApiKey, Transport, Decode,
+BelowThreshold, TemplateMismatch, ThresholdUnspecified}`.
+
+### `cross_surface`
+
+Pairwise equivalence check across N captured response files (one per
+surface). Uses Jaccard fingerprint similarity over normalized token sets.
+
+```yaml
+- cross_surface:
+    captures:                                        # optional: files this run writes
+      - surface: web                                 #   scraped from the page at this step
+        selector: "[data-test=surface]"
+        to: "${MIRROIR_SAMPLE_DIR}/baselines/surface.web.txt"
+      - surface: ios                                 #   the ios block's final screen, by OCR
+        to: "${MIRROIR_SAMPLE_DIR}/baselines/surface.ios.txt"
+    response_files:
+      - "${MIRROIR_SAMPLE_DIR}/baselines/surface.web.txt"
+      - "${MIRROIR_SAMPLE_DIR}/baselines/surface.ios.txt"
+    min_similarity: 0.5                              # required
+```
+
+A **web** capture makes the compiled spec scrape `selector`'s text at the
+step's own position in the flow and file it in the `mirroir-captures`
+attachment (the same channel `judge:` uses). An **ios** capture is the `ios`
+block's final screen: `mirroir-mcp test` OCRs it after the block's last step and
+attaches it under the fixed key `ios`, and it takes no `selector`. The step
+writes each capture to its `to` before comparing, so both surfaces are produced
+by the run that checks them. Without `captures`, every `response_files` entry
+must already exist. A declared capture the attachment never carried fails the
+step (`NotCaptured`) rather than comparing a stale file.
+
+These are checked when the plan is built, so `--validate` sees them:
+
+- `to` **must** be one of the `response_files` — a capture aimed elsewhere
+  writes text nothing reads, and the stale file at the listed path compares clean.
+- two captures may not write one file;
+- a `web` capture needs a `selector`, an `ios` capture takes none;
+- the scenario must open a block for every captured surface.
+
+A web `selector` goes through the compiled spec's `_by` helper, the same one
+every locator step uses: anything opening `[`, `#`, `.`, `:`, `>` or `*` reaches
+`page.locator` as raw CSS, and a bare word is looked up as a role / label /
+placeholder / `data-test` / visible text. A bare element name like `main` is not
+a label, matches none of those, and resolves to nothing.
+
+`min_similarity` is **required** — the threshold is the gate, and a scenario
+that never declared one holds the run to nothing. A listed file that
+fingerprints to no tokens (blank, whitespace, or punctuation only) is refused
+before any pair is scored: two empty surfaces score a perfect match, so a check
+over them would pass without evidence.
+
+A committed iOS file is named `<flow>.ios.txt`, flat under the sample's
+`baselines/`. That spelling is the contract, not a convention: `--sample`
+accounts for every `baselines/*.ios.txt` and refuses a sample committing one no
+scenario compares — see [sample-md-format.md](sample-md-format.md).
+
+`mirroir-run accept` rewrites every captured file and names each compared file
+no capture writes, leaving it alone.
+
+Errors (`CrossSurfaceError`): `TooFewFiles`, `CaptureTargetNotListed`,
+`DuplicateCaptureTarget`, `WebCaptureWithoutSelector`, `IosCaptureWithSelector`,
+`CaptureWithoutBlock`, `NotCaptured`, `EmptySurface`, `Mismatch`.
+
+---
+
+## Step kind ↔ dispatch target
+
+| Step kinds | Dispatcher | Notes |
+|---|---|---|
+| `spawn`, `kill`, `wait_port`, `assert_log`, `assert_log_clean` | `target::process` (tokio) | Per-scenario `ProcessRegistry`; shared in `boot_once` mode |
+| `http` | `target::http` (reqwest) | One `HttpClient` per scenario |
+| `target` (kind=web), `tap`, `type`, `wait_for`, `assert_visible`, `assert_not_visible`, `screenshot`, `press_key`, `swipe`, `scroll_to`, `long_press`, `drag`, `open_url`, `measure` — inside a web block | `compile::playwright` + `compile::invoke` | One spec, one `npx playwright test` per web block |
+| `target` (kind=ios), the same interaction verbs, `launch`, `home`, `shake`, `reset_app`, `set_network`, `scene` — inside an ios block | `compile::mirroir_block` + `target::ios` | One `mirroir-mcp test` per ios block, macOS host only |
+| `remember` | annotation | Neither surface: a comment in the spec when it sits inside the web run, a logged note when it sits outside, refused inside an ios block. Never splits the run. |
+| `judge` | `oracle::judge` | OpenAI, Anthropic or Ollama client, per the profile's `api_target` |
+| `cross_surface` | `oracle::drift` | Jaccard over `Fingerprint` |
+| `report` | `replay_step` | Applies the declared verdict to the scenario. |
+| `launch`, `home`, `shake`, `reset_app`, `set_network`, `scene` outside an ios block, `condition` | none | Refused at plan time: `DeviceStepOutsideIosBlock` (before the ios block), `BlockNotContiguous` (after it ended), `ConditionHasNoEvaluator` (`condition`). |

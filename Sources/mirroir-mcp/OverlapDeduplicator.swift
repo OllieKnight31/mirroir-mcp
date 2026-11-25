@@ -1,0 +1,171 @@
+/*
+ * Copyright 2026 Async-IO.org
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License"); you may not
+ * use this file except in compliance with the License. You may obtain a copy of
+ * the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ */
+// ABOUTME: Merges new viewport elements into an accumulated page using scroll offset deduplication.
+// ABOUTME: Uses composite key (text + quantized X) and page-absolute Y for robust overlap detection.
+
+import Foundation
+import HelperLib
+
+/// Merges OCR elements from scrolled viewports into an accumulated list
+/// with page-absolute coordinates. Uses composite keys (text + X bucket)
+/// and page-absolute Y for accurate overlap detection.
+enum OverlapDeduplicator {
+
+    /// Minimum text length for substring containment dedup. Elements shorter than
+    /// this are too likely to produce false positives (e.g. "On" ⊂ "Notifications").
+    static let substringMinLength = 5
+
+    /// Build a composite dedup key from text and quantized X position.
+    /// Elements with the same text at similar X positions are considered the same element,
+    /// while elements with the same text at different X positions are kept separate
+    /// (e.g., "icon" at x=50 and x=350 are distinct elements).
+    static func compositeKey(
+        _ el: TapPoint,
+        bucketSize: Double = EnvConfig.scrollDedupXBucketSize
+    ) -> String {
+        let xBucket = Int(el.tapX / bucketSize) * Int(bucketSize)
+        return "\(el.text)@\(xBucket)"
+    }
+
+    /// Merge new viewport elements into the accumulated element list.
+    ///
+    /// Uses composite key (text + quantized X) for primary dedup, then checks
+    /// page-absolute Y proximity for overlap detection. Elements carry both
+    /// viewport-relative `tapY` and page-absolute `pageY`.
+    ///
+    /// - Parameters:
+    ///   - accumulated: Previously collected elements with page-absolute pageY.
+    ///   - newViewport: Elements from the new viewport (viewport-relative coordinates).
+    ///   - cumulativeOffset: Total scroll offset accumulated so far.
+    ///   - viewportOffset: Scroll offset for this specific viewport transition.
+    ///   - windowHeight: Height of the target window.
+    ///   - strategy: Deduplication strategy for fuzzy matching.
+    /// - Returns: Merged element list sorted by page-absolute Y.
+    static func merge(
+        accumulated: [TapPoint], newViewport: [TapPoint],
+        cumulativeOffset: Double, viewportOffset: Double,
+        windowHeight: Double, strategy: ScrollDedupStrategy
+    ) -> [TapPoint] {
+        guard !newViewport.isEmpty else { return accumulated }
+        guard !accumulated.isEmpty else {
+            // First viewport: project to absolute Y (offset is 0)
+            return newViewport.map { toAbsolute($0, offset: cumulativeOffset) }
+        }
+
+        let pageYTolerance = EnvConfig.scrollDedupPageYTolerance
+
+        // Build composite key index with page-absolute Y for existing elements
+        var existingByKey: [String: [Double]] = [:]
+        for el in accumulated {
+            let key = compositeKey(el)
+            existingByKey[key, default: []].append(el.pageY)
+        }
+
+        var result = accumulated
+
+        for el in newViewport {
+            let absoluteY = el.tapY + cumulativeOffset
+            let key = compositeKey(el)
+
+            // Check composite key + pageY proximity for duplicates
+            var isDuplicate = false
+            if let existingYs = existingByKey[key] {
+                isDuplicate = existingYs.contains { abs($0 - absoluteY) < pageYTolerance }
+            }
+
+            // Substring containment: if a short element's text appears inside a nearby
+            // longer element, it's a fragment from a different OCR backend or viewport.
+            // Example: YOLO detects "marche" while Vision detects "• Distance (marche et course)".
+            if !isDuplicate {
+                let trimmed = el.text.trimmingCharacters(in: .whitespaces)
+                if trimmed.count >= substringMinLength {
+                    isDuplicate = accumulated.contains { existing in
+                        abs(existing.pageY - absoluteY) < pageYTolerance
+                        && existing.text.count > trimmed.count
+                        && existing.text.localizedCaseInsensitiveContains(trimmed)
+                    }
+                }
+            }
+
+            // Additional fuzzy checks for non-exact strategies
+            if !isDuplicate {
+                switch strategy {
+                case .exact:
+                    break
+                case .levenshtein:
+                    isDuplicate = accumulated.contains { existing in
+                        abs(existing.pageY - absoluteY) < pageYTolerance
+                        && abs(existing.tapX - el.tapX) < EnvConfig.scrollContentMatchXTolerance
+                        && levenshteinDistance(existing.text, el.text) <= EnvConfig.scrollDedupLevenshteinMax
+                    }
+                case .proximity:
+                    isDuplicate = accumulated.contains { existing in
+                        abs(existing.pageY - absoluteY) < pageYTolerance
+                        && abs(existing.tapX - el.tapX) < EnvConfig.scrollContentMatchXTolerance
+                    }
+                }
+            }
+
+            if !isDuplicate {
+                let projected = toAbsolute(el, offset: cumulativeOffset)
+                result.append(projected)
+                existingByKey[key, default: []].append(absoluteY)
+            }
+        }
+
+        return result.sorted { $0.pageY < $1.pageY }
+    }
+
+    /// Convert a viewport-relative Y coordinate to page-absolute Y.
+    static func toAbsoluteY(_ viewportY: Double, cumulativeOffset: Double) -> Double {
+        viewportY + cumulativeOffset
+    }
+
+    // MARK: - Private
+
+    private static func toAbsolute(_ el: TapPoint, offset: Double) -> TapPoint {
+        TapPoint(
+            text: el.text,
+            tapX: el.tapX,
+            tapY: el.tapY,
+            confidence: el.confidence,
+            pageY: el.tapY + offset,
+            source: el.source
+        )
+    }
+
+    private static func levenshteinDistance(_ s1: String, _ s2: String) -> Int {
+        let a = Array(s1)
+        let b = Array(s2)
+        let m = a.count
+        let n = b.count
+        guard m > 0 else { return n }
+        guard n > 0 else { return m }
+
+        var prev = Array(0...n)
+        var curr = Array(repeating: 0, count: n + 1)
+
+        for i in 1...m {
+            curr[0] = i
+            for j in 1...n {
+                let cost = a[i - 1] == b[j - 1] ? 0 : 1
+                curr[j] = min(prev[j] + 1, curr[j - 1] + 1, prev[j - 1] + cost)
+            }
+            prev = curr
+        }
+        return prev[n]
+    }
+}

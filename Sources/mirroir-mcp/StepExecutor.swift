@@ -1,0 +1,468 @@
+/*
+ * Copyright 2026 Async-IO.org
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License"); you may not
+ * use this file except in compliance with the License. You may obtain a copy of
+ * the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ */
+// ABOUTME: Executes individual skill steps against real subsystems via protocol abstractions.
+// ABOUTME: Maps each SkillStep to the appropriate subsystem call (OCR, input, capture).
+
+import Foundation
+import HelperLib
+
+/// Result of executing a single step.
+struct StepResult {
+    let step: SkillStep
+    let status: StepStatus
+    let message: String?
+    let durationSeconds: Double
+    /// What a `scene:` step played, reported in the run's captures; nil for
+    /// every other step.
+    var scene: SceneReport? = nil
+
+    enum StepStatus: String, Equatable {
+        case passed = "PASS"
+        case failed = "FAIL"
+        case skipped = "SKIP"
+        /// An AI-only step the CLI cannot run. Nothing was checked, so the skill
+        /// holding it does not pass; later steps still run.
+        case notEvaluated = "NOT EVALUATED"
+        /// A scene that ran out of budget before either predicate: a failure with
+        /// its own reason, never a pass.
+        case inconclusive = "INCONCLUSIVE"
+
+        /// Whether the step failed the skill and stops the steps after it.
+        var isFailure: Bool { self == .failed || self == .inconclusive }
+    }
+
+    /// The result of an AI-only step (`verify`, `remember`, ...): the CLI has no AI
+    /// client to evaluate it, so the step is reported as not evaluated, never as passed.
+    static func notEvaluated(_ step: SkillStep, stepType: String) -> StepResult {
+        StepResult(step: step, status: .notEvaluated,
+                   message: "not evaluated: \(stepType) needs an AI client",
+                   durationSeconds: 0)
+    }
+}
+
+/// Configuration for step execution.
+struct StepExecutorConfig {
+    /// Timeout in seconds for wait_for steps.
+    let waitForTimeoutSeconds: Int
+    /// Milliseconds to wait between steps for UI settling.
+    let settlingDelayMs: UInt32
+    /// Directory to save failure screenshots.
+    let screenshotDir: String
+    /// Whether to actually execute steps (false = dry run).
+    let dryRun: Bool
+
+    static let `default` = StepExecutorConfig(
+        waitForTimeoutSeconds: EnvConfig.waitForTimeoutSeconds,
+        settlingDelayMs: EnvConfig.stepSettlingDelayMs,
+        screenshotDir: "./mirroir-test-results",
+        dryRun: false
+    )
+}
+
+/// Executes skill steps against system subsystems via protocol abstractions.
+///
+/// **Threading contract**: StepExecutor is designed for single-threaded,
+/// sequential step execution. All calls to `execute()` must happen on the
+/// same thread. The mutable subsystem references are swapped during
+/// `switch_target` steps and are not synchronized for concurrent access.
+final class StepExecutor {
+    /// Mutable subsystem references that change when `switch_target` is executed.
+    private struct Subsystems {
+        var bridge: any WindowBridging
+        var input: any InputProviding
+        var describer: any ScreenDescribing
+        /// Local OCR, whatever `describer` is: a scene judges its predicates on it.
+        var ocrDescriber: any ScreenDescribing
+        var capture: any ScreenCapturing
+        /// What the current target is: which operations exist on it, and its layout.
+        var profile: TargetProfile
+    }
+
+    private var subsystems: Subsystems
+    let config: StepExecutorConfig
+    let registry: TargetRegistry?
+    /// The model a `scene:` step plays with; nil when none is configured, and a
+    /// scene step then fails.
+    let vision: (any VisionCompleting)?
+    /// The MCP call these steps run under, when one does (`run_steps`): its
+    /// cancel ends a wait or a scroll at the next poll. Runs outside a call
+    /// (the CLI test runner) keep the inert control nothing cancels.
+    var call = MCPCallControl()
+
+    /// What a step stopped by that cancel reports.
+    static let cancelledMessage = "the call was cancelled"
+
+    /// The checks a caller puts in front of each action a `condition` or
+    /// `repeat` runs (`run_steps` puts its driving and blocked-app checks
+    /// here): a result stops the action, nil lets it run.
+    var actionGuard: ((SkillStep) -> StepResult?)?
+
+    init(bridge: any WindowBridging,
+         input: InputProviding,
+         describer: ScreenDescribing,
+         capture: ScreenCapturing,
+         config: StepExecutorConfig = .default,
+         registry: TargetRegistry? = nil,
+         ocrDescriber: (any ScreenDescribing)? = nil,
+         vision: (any VisionCompleting)? = nil,
+         profile: TargetProfile = IPhoneMirroringTarget.profile) {
+        self.subsystems = Subsystems(
+            bridge: bridge,
+            input: input,
+            describer: describer,
+            ocrDescriber: ocrDescriber ?? describer,
+            capture: capture,
+            profile: profile
+        )
+        self.config = config
+        self.registry = registry
+        self.vision = vision
+    }
+
+    var bridge: any WindowBridging { subsystems.bridge }
+
+    /// The message for a step whose screen could not be read, naming the
+    /// window state that explains it when one does.
+    func captureFailureMessage() -> String {
+        ScreenReadFailure.message(
+            "Failed to capture screen for OCR.", targetName: bridge.targetName, state: bridge.getState())
+    }
+    var input: any InputProviding { subsystems.input }
+    var describer: any ScreenDescribing { subsystems.describer }
+    var ocrDescriber: any ScreenDescribing { subsystems.ocrDescriber }
+    var capture: any ScreenCapturing { subsystems.capture }
+    var profile: TargetProfile { subsystems.profile }
+
+    /// Swap subsystem references when switching targets.
+    func switchSubsystems(bridge: any WindowBridging, input: any InputProviding,
+                          describer: any ScreenDescribing, ocrDescriber: any ScreenDescribing,
+                          capture: any ScreenCapturing, profile: TargetProfile) {
+        subsystems = Subsystems(bridge: bridge, input: input, describer: describer,
+                                ocrDescriber: ocrDescriber, capture: capture, profile: profile)
+    }
+
+    /// Execute a single step and return the result.
+    func execute(step: SkillStep, stepIndex: Int, skillName: String) -> StepResult {
+        let startTime = CFAbsoluteTimeGetCurrent()
+
+        // Before the dry-run shortcut: a dry run must not report as passed a step
+        // that no run of this command can evaluate.
+        if let stepType = step.aiOnlyStepType {
+            return .notEvaluated(step, stepType: stepType)
+        }
+        if let refusal = unsupportedRefusal(of: step) {
+            return StepResult(step: step, status: .failed, message: refusal,
+                              durationSeconds: elapsed(startTime))
+        }
+
+        if config.dryRun {
+            let duration = CFAbsoluteTimeGetCurrent() - startTime
+            // A dry run plays nothing, so a scene is not evaluated, never passed.
+            if case .scene = step {
+                return StepResult(step: step, status: .notEvaluated,
+                                  message: "not evaluated: a dry run plays no scene",
+                                  durationSeconds: duration)
+            }
+            return StepResult(step: step, status: .passed,
+                              message: "dry run", durationSeconds: duration)
+        }
+
+        let result: StepResult
+
+        switch step {
+        case .launch(let appName):
+            result = executeLaunch(appName: appName, startTime: startTime)
+        case .tap(let label):
+            result = executeTap(label: label, startTime: startTime)
+        case .type(let text):
+            result = executeType(text: text, startTime: startTime)
+        case .clearField:
+            result = executeClearField(startTime: startTime)
+        case .pressKey(let keyName, let modifiers):
+            result = executePressKey(keyName: keyName, modifiers: modifiers,
+                                     startTime: startTime)
+        case .swipe(let direction):
+            result = executeSwipe(direction: direction, startTime: startTime)
+        case .waitFor(let label, let timeout):
+            result = executeWaitFor(label: label,
+                                    timeoutSeconds: timeout ?? config.waitForTimeoutSeconds,
+                                    startTime: startTime)
+        case .assertVisible(let label):
+            result = executeAssertVisible(label: label, startTime: startTime)
+        case .assertNotVisible(let label):
+            result = executeAssertNotVisible(label: label, startTime: startTime)
+        case .screenshot(let label):
+            result = executeScreenshot(label: label, skillName: skillName,
+                                       startTime: startTime)
+        case .home:
+            result = executeHome(startTime: startTime)
+        case .openURL(let url):
+            result = executeOpenURL(url: url, startTime: startTime)
+        case .shake:
+            result = executeShake(startTime: startTime)
+        case .longPress(let label, let durationMs):
+            result = executeLongPress(label: label, durationMs: durationMs,
+                                       startTime: startTime)
+        case .drag(let fromLabel, let toLabel):
+            result = executeDrag(fromLabel: fromLabel, toLabel: toLabel,
+                                  startTime: startTime)
+        case .scrollTo(let label, let direction, let maxScrolls):
+            result = executeScrollTo(label: label, direction: direction,
+                                      maxScrolls: maxScrolls, startTime: startTime)
+        case .resetApp(let appName):
+            result = executeResetApp(appName: appName, startTime: startTime)
+        case .setNetwork(let mode):
+            result = executeSetNetwork(mode: mode, startTime: startTime)
+        case .measure(let name, let action, let until, let maxSeconds):
+            result = executeMeasure(name: name, action: action, until: until,
+                                     maxSeconds: maxSeconds, stepIndex: stepIndex,
+                                     skillName: skillName, startTime: startTime)
+        case .switchTarget(let selector):
+            result = executeSwitchTarget(selector: selector, startTime: startTime)
+        case .condition(let check, let action):
+            result = executeCondition(check: check, action: action, stepIndex: stepIndex,
+                                      skillName: skillName, startTime: startTime)
+        case .repeatUntil(let check, let maxIterations, let body):
+            result = executeRepeat(check: check, maxIterations: maxIterations, body: body,
+                                   stepIndex: stepIndex, skillName: skillName, startTime: startTime)
+        case .scene(let skill, let budget, let decider):
+            result = executeScene(skill: skill, budget: budget, decider: decider, stepIndex: stepIndex,
+                                  skillName: skillName, startTime: startTime)
+        case .skipped(let stepType, let reason):
+            let duration = CFAbsoluteTimeGetCurrent() - startTime
+            result = StepResult(step: step, status: .skipped,
+                                message: "\(stepType): \(reason)",
+                                durationSeconds: duration)
+        case .invalid(let stepType, let reason):
+            let duration = CFAbsoluteTimeGetCurrent() - startTime
+            result = StepResult(step: step, status: .failed,
+                                message: "\(stepType): \(reason)",
+                                durationSeconds: duration)
+        }
+
+        // Save failure screenshot for debugging
+        if result.status.isFailure {
+            captureFailureScreenshot(stepIndex: stepIndex, skillName: skillName)
+        }
+
+        // Inter-step settling delay
+        if result.status != .skipped {
+            usleep(config.settlingDelayMs * 1000)
+        }
+
+        return result
+    }
+
+    // MARK: - Step Implementations
+
+    private func executeLaunch(appName: String, startTime: CFAbsoluteTime) -> StepResult {
+        let step = SkillStep.launch(appName: appName)
+        if let error = input.launchApp(name: appName) {
+            return StepResult(step: step, status: .failed, message: error,
+                              durationSeconds: elapsed(startTime))
+        }
+        // Confirmed the way the launch_app tool confirms it: a launch that
+        // left Spotlight or the Home Screen up opened nothing (carnet#27).
+        let outcome = LaunchAppConfirmation.outcome(
+            appName: appName, describer: describer,
+            windowHeight: bridge.getWindowInfo().map { Double($0.size.height) })
+        let report = outcome.content.compactMap { content -> String? in
+            if case .text(let text) = content { return text }
+            return nil
+        }.joined(separator: " ")
+        return StepResult(step: step, status: outcome.isError ? .failed : .passed,
+                          message: outcome.isError ? report : nil,
+                          durationSeconds: elapsed(startTime))
+    }
+
+    private func executeTap(label: String, startTime: CFAbsoluteTime) -> StepResult {
+        let step = SkillStep.tap(label: label)
+
+        // A tap recorded by coordinates alone (an icon with no text) has nothing to find.
+        guard !label.isEmpty else {
+            return StepResult(step: step, status: .failed,
+                              message: "tap has no element text: it was recorded by coordinates, "
+                                + "so it replays only from its compiled file, never by live OCR",
+                              durationSeconds: elapsed(startTime))
+        }
+
+        if let point = TapStepPoint.parse(label) {
+            let error = input.tap(x: point.x, y: point.y)
+            return StepResult(step: step, status: error == nil ? .passed : .failed,
+                              message: error ?? "tapped by coordinates",
+                              durationSeconds: elapsed(startTime))
+        }
+
+        guard let describeResult = describer.describe() else {
+            return StepResult(step: step, status: .failed,
+                              message: captureFailureMessage(),
+                              durationSeconds: elapsed(startTime))
+        }
+
+        guard let match = ElementMatcher.findMatch(label: label, in: describeResult.elements) else {
+            let available = describeResult.elements.map { $0.text }.joined(separator: ", ")
+            return StepResult(step: step, status: .failed,
+                              message: "Element \"\(label)\" not found on screen. Visible: [\(available)]",
+                              durationSeconds: elapsed(startTime))
+        }
+
+        // On the Home Screen a label opens nothing: the tap goes to its icon.
+        let height = Double(bridge.getWindowInfo()?.size.height ?? 0)
+        let point = SpotlightDetector.isHomeScreenVisible(elements: describeResult.elements, windowHeight: height)
+            ? HomeScreenAppIcon.tapPoint(for: match.element, in: describeResult.elements)
+            : (match.element.tapX, match.element.tapY)
+        if let error = input.tap(x: point.0, y: point.1) {
+            return StepResult(step: step, status: .failed, message: error,
+                              durationSeconds: elapsed(startTime))
+        }
+
+        return StepResult(step: step, status: .passed,
+                          message: "matched via \(match.strategy.rawValue)",
+                          durationSeconds: elapsed(startTime))
+    }
+
+    private func executeType(text: String, startTime: CFAbsoluteTime) -> StepResult {
+        let step = SkillStep.type(text: text)
+        let result = input.typeText(text)
+        if !result.success {
+            return StepResult(step: step, status: .failed,
+                              message: result.error ?? "Type failed",
+                              durationSeconds: elapsed(startTime))
+        }
+        return StepResult(step: step, status: .passed, message: result.notice,
+                          durationSeconds: elapsed(startTime))
+    }
+
+    private func executePressKey(keyName: String, modifiers: [String],
+                                 startTime: CFAbsoluteTime) -> StepResult {
+        let step = SkillStep.pressKey(keyName: keyName, modifiers: modifiers)
+        let result = input.pressKey(keyName: keyName, modifiers: modifiers)
+        if !result.success {
+            return StepResult(step: step, status: .failed,
+                              message: result.error ?? "Press key failed",
+                              durationSeconds: elapsed(startTime))
+        }
+        return StepResult(step: step, status: .passed, message: nil,
+                          durationSeconds: elapsed(startTime))
+    }
+
+    private func executeSwipe(direction: String, startTime: CFAbsoluteTime) -> StepResult {
+        let step = SkillStep.swipe(direction: direction)
+
+        // Get window size for computing swipe coordinates
+        guard let windowInfo = bridge.getWindowInfo() else {
+            return StepResult(step: step, status: .failed,
+                              message: "Could not get window info for swipe",
+                              durationSeconds: elapsed(startTime))
+        }
+
+        guard let ep = ScrollSeeker.endpoints(
+            fingerDirection: direction, window: windowInfo.size, around: nil) else {
+            return StepResult(step: step, status: .failed,
+                              message: "Unknown swipe direction: \(direction). Use up/down/left/right.",
+                              durationSeconds: elapsed(startTime))
+        }
+
+        if let error = input.swipe(fromX: ep.fromX, fromY: ep.fromY,
+                                    toX: ep.toX, toY: ep.toY, durationMs: EnvConfig.defaultSwipeDurationMs) {
+            return StepResult(step: step, status: .failed, message: error,
+                              durationSeconds: elapsed(startTime))
+        }
+
+        return StepResult(step: step, status: .passed, message: nil,
+                          durationSeconds: elapsed(startTime))
+    }
+
+    private func executeScreenshot(label: String, skillName: String,
+                                   startTime: CFAbsoluteTime) -> StepResult {
+        let step = SkillStep.screenshot(label: label)
+
+        guard let data = captureScreenshotData() else {
+            return StepResult(step: step, status: .failed,
+                              message: "Failed to capture screenshot",
+                              durationSeconds: elapsed(startTime))
+        }
+
+        let safeName = skillName.replacingOccurrences(of: " ", with: "_")
+        let safeLabel = label.replacingOccurrences(of: " ", with: "_")
+        let filename = "\(safeName)_\(safeLabel).png"
+
+        guard let path = saveScreenshot(data, filename: filename) else {
+            return StepResult(step: step, status: .failed,
+                              message: "Failed to save screenshot",
+                              durationSeconds: elapsed(startTime))
+        }
+
+        return StepResult(step: step, status: .passed,
+                          message: "saved to \(path)",
+                          durationSeconds: elapsed(startTime))
+    }
+
+    private func executeHome(startTime: CFAbsoluteTime) -> StepResult {
+        let step = SkillStep.home
+        let outcome = MirroringMenuCommand.pressHome(bridge: bridge, input: input, describer: describer)
+        switch outcome {
+        case .reached:
+            return StepResult(step: step, status: .passed, message: nil,
+                              durationSeconds: elapsed(startTime))
+        case .unchanged:
+            return StepResult(step: step, status: .passed, message: outcome.report,
+                              durationSeconds: elapsed(startTime))
+        case .failed(let error):
+            return StepResult(step: step, status: .failed, message: error,
+                              durationSeconds: elapsed(startTime))
+        }
+    }
+
+    private func executeClearField(startTime: CFAbsoluteTime) -> StepResult {
+        let result = FieldClearing.clear(using: input)
+        return StepResult(step: .clearField, status: result.success ? .passed : .failed,
+                          message: result.error, durationSeconds: elapsed(startTime))
+    }
+
+    private func executeOpenURL(url: String, startTime: CFAbsoluteTime) -> StepResult {
+        let step = SkillStep.openURL(url: url)
+        if let error = input.openURL(url) {
+            return StepResult(step: step, status: .failed, message: error,
+                              durationSeconds: elapsed(startTime))
+        }
+        return StepResult(step: step, status: .passed, message: nil,
+                          durationSeconds: elapsed(startTime))
+    }
+
+    private func executeShake(startTime: CFAbsoluteTime) -> StepResult {
+        let step = SkillStep.shake
+        let result = input.shake()
+        if !result.success {
+            return StepResult(step: step, status: .failed,
+                              message: result.error ?? "Shake failed",
+                              durationSeconds: elapsed(startTime))
+        }
+        return StepResult(step: step, status: .passed, message: nil,
+                          durationSeconds: elapsed(startTime))
+    }
+
+    // MARK: - Helpers
+
+    func elapsed(_ startTime: CFAbsoluteTime) -> Double {
+        CFAbsoluteTimeGetCurrent() - startTime
+    }
+
+    /// Convenience cast to MenuActionCapable for steps that need menu actions.
+    var menuBridge: (any MenuActionCapable)? {
+        bridge as? (any MenuActionCapable)
+    }
+}

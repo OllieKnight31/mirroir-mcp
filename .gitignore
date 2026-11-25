@@ -1,0 +1,49 @@
+.DS_Store
+.envrc
+/.build
+/Packages
+xcuserdata/
+DerivedData/
+.swiftpm/configuration/registries.json
+.swiftpm/xcode/package.xcworkspace/contents.xcworkspacedata
+.netrc
+.mcp.json
+.mcpregistry_*
+claude_docs
+claude_code/*
+update-helper.sh
+npm/bin/mirroir-mcp-native
+npm/bin/mirroir-helper
+npm/bin/com.jfarcand.mirroir-helper.plist
+# Local skills symlink (machine-specific path) — no trailing slash so it also
+# matches the symlink itself, not just a real directory. targets.json stays tracked.
+.mirroir-mcp/skills
+.mirroir-mcp/settings.json
+# Scratch space for session artifacts (workflow scripts, drafts) — never shipped.
+scratch/
+# Claude Code local session + memory data (machine-specific).
+.claude/projects/
+.claude/skills/*
+# The register-limitation skill ships with the repo — it documents the
+# limitation-register procedure every contributor's agent must follow.
+!.claude/skills/register-limitation/
+# The mirroir-onboard skill is the web recorder half of the runner architecture
+# (agent + chrome-devtools-mcp records; mirroir-run replays). Shipped artifacts
+# reference it by name, so it belongs in the repo.
+!.claude/skills/mirroir-onboard/
+# carnet works the private register and bilan measures a session's completion;
+# the hooks in .claude/settings.json run their scripts, so both ship with the repo.
+!.claude/skills/carnet/
+!.claude/skills/bilan/
+mirroir-test-results/
+scripts/test-vd*
+scripts/*.o
+opencode.json
+package.json
+package-lock.json
+.claude/worktrees/
+.vscode/launch.json
+website/node_modules/
+website/dist/
+website/.astro/
+website/src/data/skills-index.json

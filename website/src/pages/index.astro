@@ -1,0 +1,418 @@
+---
+// ABOUTME: The mirroir.dev landing page: hero, demo videos, install, the three modes, safety and a short FAQ.
+// ABOUTME: Reference material (install options, tools, skills, testing, comparison) lives on pages/docs.astro.
+import Layout from "../layouts/Layout.astro";
+import { Code } from "astro:components";
+import "../styles/global.css";
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
+
+// Build-time data files resolve from the project root (process.cwd() is the
+// website/ dir during `astro build`). Astro 6 bundles prerendered pages into
+// dist/.prerender/, so import.meta.url-relative paths no longer point here.
+const serverJsonPath = resolve(process.cwd(), "../server.json");
+const serverJson = JSON.parse(readFileSync(serverJsonPath, "utf-8"));
+const version = serverJson.version;
+
+const npxCmd = "npx -y mirroir-mcp install";
+const curlCmd = '/bin/bash -c "$(curl -fsSL https://mirroir.dev/get-mirroir.sh)"';
+const brewCmd = "brew tap jfarcand/tap && brew install mirroir-mcp";
+const setupPrompt = "Set up mirroir-mcp so you can drive my iPhone: follow https://github.com/OllieKnight31/mirroir-mcp/blob/main/docs/onboarding.md step by step, and finish by reading back what my iPhone screen shows.";
+const docs = `${import.meta.env.BASE_URL}docs/`;
+const pipeline = `your agent ──MCP──▶ mirroir ──iPhone Mirroring──▶ your iPhone
+                       │
+   explore ──▶ SKILL.md ──▶ compile ──▶ replay, no LLM ──▶ CI: pass · fail · DRIFT`;
+const repoDocs = "https://github.com/OllieKnight31/mirroir-mcp/blob/main/docs/";
+// GitHub serves the newest release asset at this fixed path.
+const mcpbUrl = "https://github.com/OllieKnight31/mirroir-mcp/releases/latest/download/mirroir-mcp.mcpb";
+const skillTimer = `---
+name: Set Timer
+app: Clock
+---
+
+## Steps
+
+1. Launch **Clock**
+2. Tap "Timer"
+3. Tap "Start"
+4. Verify "Pause" is visible`;
+---
+
+<Layout
+  title="mirroir-mcp: real iPhone automation for AI agents over MCP"
+  description="Let your AI agent use your real iPhone over MCP, with no Developer Mode, Xcode or WebDriverAgent. Build agents and automations across any app, play games, then replay a flow without an LLM."
+  softwareVersion={version}
+>
+  <!-- Hero -->
+  <header>
+    <img src={`${import.meta.env.BASE_URL}mirroir-wordmark.svg`} alt="mirroir-mcp logo" class="logo" width="80" height="100" />
+    <h1>mirroir-mcp</h1>
+    <p class="tagline">
+      Let your agent use your real iPhone.
+    </p>
+    <p class="subtitle">
+      A personal agent, a game player, and automation that replays without an LLM. <strong>No Developer Mode, no connector, no password handed to anyone.</strong>
+    </p>
+    <div class="hero-cta">
+      <a class="btn-primary" href="#demo">Watch the demo</a>
+      <a class="btn-secondary" href="#install">Install</a>
+      <a class="btn-secondary" href="https://github.com/OllieKnight31/mirroir-mcp" rel="noopener noreferrer">View on GitHub</a>
+    </div>
+    <p class="hero-requirements">
+      <strong>Your phone. Your apps. Your agent.</strong> Cloud phone services rent you a phone. mirroir drives the one in your pocket, and turns what your agent does once into skills and tests you keep.
+    </p>
+    <p class="hero-requirements">
+      Needs macOS 15 or later and <a href="https://support.apple.com/en-us/120421" rel="noopener noreferrer">iPhone Mirroring</a>.
+    </p>
+  </header>
+
+  <main>
+  <!-- Demo Videos -->
+  <section class="demo-section" id="demo">
+    <h2>Real runs on a real iPhone</h2>
+    <div class="carousel demo-carousel">
+      <div class="carousel-track">
+        <div class="carousel-slide demo-slide">
+          <h3>Your DJ on Spotify</h3>
+          <video class="demo-wide" loop muted playsinline preload="metadata" tabindex="0" data-full={`${import.meta.env.BASE_URL}spotify-dj-playlist.full.mp4`} data-full-label="Watch the full run (49 s)" poster={`${import.meta.env.BASE_URL}spotify-dj-playlist.poster.jpg`} aria-label="The Claude app and a real iPhone side by side: the agent asks what to play, builds a five-track Gui Boratto-style playlist in Spotify, then starts it">
+            <source src={`${import.meta.env.BASE_URL}spotify-dj-playlist.mp4`} type="video/mp4" />
+          </video>
+          <p class="demo-caption">Asks what you want to hear, builds the playlist in Spotify, plays it. Sped up.</p>
+        </div>
+        <div class="carousel-slide demo-slide">
+          <h3>Recipe reel to grocery list</h3>
+          <video class="demo-wide" loop muted playsinline preload="none" tabindex="0" data-full={`${import.meta.env.BASE_URL}recipe-grocery-list.full.mp4`} data-full-label="Watch the full run (46 s)" poster={`${import.meta.env.BASE_URL}recipe-grocery-list.poster.jpg`} aria-label="The Claude app and a real iPhone side by side: the agent opens a saved Instagram recipe reel, listens to it, then writes an eleven-item grocery list in Reminders">
+            <source src={`${import.meta.env.BASE_URL}recipe-grocery-list.mp4`} type="video/mp4" />
+          </video>
+          <p class="demo-caption">A saved recipe reel becomes a grocery list. Sped up.</p>
+        </div>
+        <div class="carousel-slide demo-slide">
+          <h3>Chess against the strongest bot</h3>
+          <video class="demo-wide" loop muted playsinline preload="none" tabindex="0" poster={`${import.meta.env.BASE_URL}chess-vs-maximum.poster.jpg`} aria-label="The console and a real iPhone side by side during a full chess game: each move is logged as it is played, ending in checkmate against the Maximum bot on Chess.com">
+            <source src={`${import.meta.env.BASE_URL}chess-vs-maximum.mp4`} type="video/mp4" />
+          </video>
+          <p class="demo-caption">Stockfish picks, mirroir plays, against Chess.com's strongest bot. Sped up.</p>
+        </div>
+        <div class="carousel-slide demo-slide">
+          <h3>Cross-app errand</h3>
+          <video class="demo-wide" loop muted playsinline preload="none" tabindex="0" poster={`${import.meta.env.BASE_URL}video2-waze-slack.poster.jpg`} aria-label="An AI agent reads the commute time in Waze on a real iPhone, then posts it in Slack">
+            <source src={`${import.meta.env.BASE_URL}video2-waze-slack.mp4`} type="video/mp4" />
+          </video>
+          <p class="demo-caption">Reads the ETA in Waze, posts it in Slack. Sped up.</p>
+        </div>
+        <div class="carousel-slide demo-slide">
+          <h3>Login flow</h3>
+          <video loop muted playsinline preload="none" tabindex="0" poster={`${import.meta.env.BASE_URL}video1-expo-login.poster.jpg`} aria-label="An AI agent tests a login screen in Expo Go on a real iPhone">
+            <source src={`${import.meta.env.BASE_URL}video1-expo-login.mp4`} type="video/mp4" />
+          </video>
+          <p class="demo-caption">Tests a login screen in Expo Go. Sped up.</p>
+        </div>
+      </div>
+      <button class="carousel-prev" aria-label="Previous">&#8249;</button>
+      <button class="carousel-next" aria-label="Next">&#8250;</button>
+      <div class="carousel-dots"></div>
+    </div>
+    <div class="demo-lightbox" id="demo-lightbox" role="dialog" aria-label="Video lightbox" aria-modal="true">
+      <button class="lightbox-close" aria-label="Close lightbox">&times;</button>
+      <video loop muted playsinline controls id="demo-lightbox-video"></video>
+    </div>
+    <script>
+      // A demo plays only while at least this share of it is on screen, so the
+      // slides scrolled out of the carousel neither download nor run.
+      const PLAYING_VISIBLE_RATIO = 0.5;
+      const demoVideos = Array.from(document.querySelectorAll(".demo-slide video")) as HTMLVideoElement[];
+
+      // Autoplay videos only when reduced-motion is not preferred
+      const prefersReducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+      if (!prefersReducedMotion) {
+        const playback = new IntersectionObserver(
+          (entries) => {
+            entries.forEach((entry) => {
+              const vid = entry.target as HTMLVideoElement;
+              if (entry.isIntersecting) {
+                vid.play().catch(() => {});
+              } else {
+                vid.pause();
+              }
+            });
+          },
+          { threshold: PLAYING_VISIBLE_RATIO }
+        );
+        demoVideos.forEach((vid) => playback.observe(vid));
+      }
+
+      const lightbox = document.getElementById("demo-lightbox")!;
+      const lbVideo = document.getElementById("demo-lightbox-video")! as HTMLVideoElement;
+      const lbClose = lightbox.querySelector(".lightbox-close")! as HTMLButtonElement;
+      let triggerElement: HTMLElement | null = null;
+
+      function openLightbox(src: string, trigger: HTMLElement) {
+        triggerElement = trigger;
+        lbVideo.innerHTML = "";
+        const source = document.createElement("source");
+        source.src = src;
+        source.type = "video/mp4";
+        lbVideo.appendChild(source);
+        lbVideo.load();
+        lbVideo.play();
+        lightbox.classList.add("active");
+        document.documentElement.classList.add("scroll-lock");
+        lbClose.focus();
+      }
+
+      function closeLightbox() {
+        lightbox.classList.remove("active");
+        document.documentElement.classList.remove("scroll-lock");
+        lbVideo.pause();
+        if (triggerElement) {
+          triggerElement.focus();
+          triggerElement = null;
+        }
+      }
+
+      demoVideos.forEach((vid) => {
+        // Enlarged, a demo plays its full-length cut when it has one (data-full),
+        // otherwise the same loop shown in the carousel.
+        const src = vid.dataset.full ?? vid.querySelector("source")!.src;
+        const open = () => openLightbox(src, vid);
+        vid.addEventListener("click", open);
+        const expand = document.createElement("button");
+        expand.type = "button";
+        expand.className = "demo-expand";
+        expand.textContent = `${vid.dataset.fullLabel ?? "Enlarge"} ⤢`;
+        expand.addEventListener("click", () => openLightbox(src, expand));
+        vid.insertAdjacentElement("afterend", expand);
+        // The video is the lightbox's only trigger, so it answers the keyboard too.
+        vid.addEventListener("keydown", (e) => {
+          if (e.key === "Enter" || e.key === " ") {
+            e.preventDefault();
+            open();
+          }
+        });
+      });
+
+      lbClose.addEventListener("click", closeLightbox);
+
+      lightbox.addEventListener("click", (e) => {
+        if (e.target === lightbox) {
+          closeLightbox();
+        }
+      });
+
+      document.addEventListener("keydown", (e) => {
+        if (!lightbox.classList.contains("active")) return;
+        if (e.key === "Escape") {
+          closeLightbox();
+        }
+        // Focus trap: cycle between close button and video
+        if (e.key === "Tab") {
+          const focusable = [lbClose, lbVideo];
+          const first = focusable[0];
+          const last = focusable[focusable.length - 1];
+          if (e.shiftKey) {
+            if (document.activeElement === first) {
+              e.preventDefault();
+              last.focus();
+            }
+          } else {
+            if (document.activeElement === last) {
+              e.preventDefault();
+              first.focus();
+            }
+          }
+        }
+      });
+    </script>
+  </section>
+
+  <!-- Star banner -->
+  <a class="star-banner" href="https://github.com/OllieKnight31/mirroir-mcp" rel="noopener noreferrer">
+    <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true" fill="currentColor">
+      <path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/>
+    </svg>
+    <span>Like mirroir-mcp? <strong>Star us on GitHub</strong> &#9733;</span>
+  </a>
+
+  <!-- Three modes -->
+  <section id="why">
+    <h2>Three ways to use it</h2>
+    <div class="example-cards">
+      <div class="example-card">
+        <p class="example-prompt">Your personal agent</p>
+        <p class="example-steps">Errands across the apps already signed in on your phone. It reads the screen and listens: a saved recipe reel becomes a grocery list. No connector, no password handed to anyone.</p>
+        <p class="example-steps"><a href="https://github.com/OllieKnight31/mirroir-mcp#more-demos" rel="noopener noreferrer">Details on GitHub</a></p>
+      </div>
+      <div class="example-card">
+        <p class="example-prompt">Games</p>
+        <p class="example-steps">It plays turn-based and tap-driven games, frame by frame, under a budget. With Stockfish choosing the moves, it beat Chess.com's strongest bot.</p>
+        <p class="example-steps"><a href="https://github.com/OllieKnight31/mirroir-mcp/blob/main/docs/games.md" rel="noopener noreferrer">Details on GitHub</a></p>
+      </div>
+      <div class="example-card">
+        <p class="example-prompt">Automation</p>
+        <p class="example-steps">A flow that worked becomes a skill that replays without an LLM. <code>mirroir-run</code> runs it in CI with the web and your API, and flags drift.</p>
+        <p class="example-steps"><a href="https://github.com/OllieKnight31/mirroir-mcp#the-framework" rel="noopener noreferrer">Details on GitHub</a></p>
+      </div>
+    </div>
+    <h3 class="compare-title">A skill is a short Markdown file</h3>
+    <Code code={skillTimer} lang="markdown" theme="github-dark" />
+    <p class="alt-install">Steps match text on screen, not coordinates. Once compiled, <code>mirroir test</code> replays it without an LLM. <a href="https://github.com/jfarcand/mirroir-skills/blob/main/skills/apps/clock/set-timer.md" rel="noopener noreferrer">The full skill</a> &middot; <a href={`${docs}#skills`}>More skills</a></p>
+  </section>
+
+  <!-- How it works -->
+  <section id="how-it-works">
+    <h2>How it works</h2>
+    <Code code={pipeline} lang="text" theme="github-dark" />
+    <p>Your agent drives the phone through mirroir's tools. What it learns stays: an exploration becomes a skill, a skill compiles to a replay that needs no model, and the replay runs in CI.</p>
+    <ul class="short-list">
+      <li><strong><a href={`${repoDocs}tools.md`} rel="noopener noreferrer">Tools.</a></strong> 42 MCP tools to tap, type, swipe, read the screen and listen.</li>
+      <li><strong><a href={`${repoDocs}skills-and-ci.md`} rel="noopener noreferrer">Skills.</a></strong> <code>generate_skill</code> explores an app and writes SKILL.md files.</li>
+      <li><strong><a href={`${repoDocs}compiled-skills.md`} rel="noopener noreferrer">Compiled replay.</a></strong> <code>mirroir test</code> replays a skill with no AI in the loop.</li>
+      <li><strong><a href={`${repoDocs}mirroir-run.md`} rel="noopener noreferrer">mirroir-run.</a></strong> One scenario across iPhone, browser and HTTP, with a <code>DRIFT</code> verdict.</li>
+    </ul>
+  </section>
+  <!-- Install -->
+  <section id="install">
+    <h2>Install <span class="version-badge">v{version}</span></h2>
+    <p class="alt-install">Paste this into your coding agent:</p>
+    <div class="install-block">
+      <code>{setupPrompt}</code>
+      <button class="copy-btn" data-copy={setupPrompt}>Copy</button>
+    </div>
+    <p class="alt-install">Or install it yourself:</p>
+    <div class="install-block">
+      <code><span class="prompt">$</span> {brewCmd}</code>
+      <button class="copy-btn" data-copy={brewCmd}>Copy</button>
+    </div>
+    <div class="install-block install-block-alt">
+      <code><span class="prompt">$</span> {npxCmd}</code>
+      <button class="copy-btn" data-copy={npxCmd}>Copy</button>
+    </div>
+    <div class="install-block install-block-alt">
+      <code><span class="prompt">$</span> {curlCmd}</code>
+      <button class="copy-btn" data-copy={curlCmd}>Copy</button>
+    </div>
+    <p class="alt-install">Claude Desktop: download the extension and double-click it.</p>
+    <div class="hero-cta">
+      <a class="btn-primary" href={mcpbUrl} download>Download mirroir-mcp.mcpb</a>
+    </div>
+    <p class="alt-install">
+      Claude Code plugin, Hermes Agent: <a href={`${docs}#install`}>every install option</a>.
+    </p>
+  </section>
+
+  <!-- Safety -->
+  <section>
+    <h2>Safety</h2>
+    <ul class="short-list">
+      <li><strong>Read-only by default.</strong> Tools that change anything stay hidden until you allow them.</li>
+      <li><strong>Block apps.</strong> Keep the agent out of Wallet or your bank.</li>
+      <li><strong>Stop anytime.</strong> Quit iPhone Mirroring or lock the Mac.</li>
+    </ul>
+    <p><a href="https://github.com/OllieKnight31/mirroir-mcp/blob/main/docs/security.md" rel="noopener noreferrer">Security model</a></p>
+  </section>
+
+  <!-- FAQ -->
+  <section>
+    <h2>FAQ</h2>
+    <div class="faq-list">
+      <details>
+        <summary>Does it work with any iPhone app?</summary>
+        <p>Yes. If iPhone Mirroring shows it, your agent can use it.</p>
+      </details>
+      <details>
+        <summary>Will it take over my Mac?</summary>
+        <p>Through macOS 26, no: taps and typing reach the phone while you keep working; a drag or pinch brings iPhone Mirroring forward for a moment. On macOS 27, each action brings it forward.</p>
+      </details>
+      <details>
+        <summary>Does my phone's audio leave my Mac?</summary>
+        <p>No. macOS transcribes it on the Mac. Screenshots go to the model that runs your agent.</p>
+      </details>
+      <details>
+        <summary>Which agents work with it?</summary>
+        <p>Any MCP client: Claude Code, Codex, Cursor, Claude Desktop, Hermes and more.</p>
+      </details>
+    </div>
+    <p>
+      <a href="https://github.com/OllieKnight31/mirroir-mcp/blob/main/docs/faq.md" rel="noopener noreferrer">Full FAQ</a>
+    </p>
+  </section>
+
+  <!-- Carousel initialization -->
+  <script>
+    document.querySelectorAll(".carousel").forEach((carousel) => {
+      const track = carousel.querySelector(".carousel-track") as HTMLElement;
+      const slides = Array.from(carousel.querySelectorAll(".carousel-slide")) as HTMLElement[];
+      const prevBtn = carousel.querySelector(".carousel-prev") as HTMLButtonElement;
+      const nextBtn = carousel.querySelector(".carousel-next") as HTMLButtonElement;
+      const dotsContainer = carousel.querySelector(".carousel-dots")!;
+
+      if (slides.length < 2) {
+        prevBtn.style.display = "none";
+        nextBtn.style.display = "none";
+        dotsContainer.remove();
+        return;
+      }
+
+      let currentIndex = 0;
+
+      slides.forEach((_, i) => {
+        const dot = document.createElement("button");
+        dot.classList.add("carousel-dot");
+        dot.setAttribute("aria-label", `Go to slide ${i + 1}`);
+        if (i === 0) dot.classList.add("active");
+        dot.addEventListener("click", () => goTo(i));
+        dotsContainer.appendChild(dot);
+      });
+
+      function goTo(index: number) {
+        currentIndex = Math.max(0, Math.min(index, slides.length - 1));
+        track.scrollTo({
+          left: slides[currentIndex].offsetLeft - track.offsetLeft,
+          behavior: "smooth",
+        });
+        updateUI();
+      }
+
+      // The track takes the height of the slide on screen, so a short slide
+      // does not keep the empty space a taller one needs.
+      function fitHeight() {
+        track.style.height = `${slides[currentIndex].offsetHeight}px`;
+      }
+
+      function updateUI() {
+        fitHeight();
+        prevBtn.disabled = currentIndex === 0;
+        nextBtn.disabled = currentIndex === slides.length - 1;
+        dotsContainer.querySelectorAll(".carousel-dot").forEach((dot, i) => {
+          dot.classList.toggle("active", i === currentIndex);
+        });
+      }
+
+      prevBtn.addEventListener("click", () => goTo(currentIndex - 1));
+      nextBtn.addEventListener("click", () => goTo(currentIndex + 1));
+
+      const observer = new IntersectionObserver(
+        (entries) => {
+          entries.forEach((entry) => {
+            if (entry.isIntersecting) {
+              const index = slides.indexOf(entry.target as HTMLElement);
+              if (index >= 0) {
+                currentIndex = index;
+                updateUI();
+              }
+            }
+          });
+        },
+        { root: track, threshold: 0.6 }
+      );
+      slides.forEach((slide) => observer.observe(slide));
+
+      // Posters and videos load after the first layout and change a slide's height.
+      const resizer = new ResizeObserver(fitHeight);
+      slides.forEach((slide) => resizer.observe(slide));
+
+      updateUI();
+    });
+  </script>
+  </main>
+</Layout>

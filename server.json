@@ -1,0 +1,21 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.jfarcand/mirroir-mcp",
+  "description": "Drive a stock iPhone via iPhone Mirroring: no Developer Mode, Xcode or WDA. LLM-free skill replay.",
+  "repository": {
+    "url": "https://github.com/OllieKnight31/mirroir-mcp",
+    "source": "github"
+  },
+  "version": "0.51.0",
+  "packages": [
+    {
+      "registryType": "npm",
+      "identifier": "mirroir-mcp",
+      "version": "0.51.0",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": []
+    }
+  ]
+}

@@ -1,0 +1,124 @@
+# Known Limitations
+
+## Focus Stealing
+
+On iPhone Mirroring, taps, keystrokes and swipes no longer take the front: the app you are using keeps keyboard focus and the cursor does not move. Drags and two-finger gestures still bring iPhone Mirroring forward for their duration, then return the front and the pointer.
+
+| Input | Front app | How it reaches the iPhone |
+|-------|-----------|---------------------------|
+| `tap`, `double_tap`, `long_press`, `press_back` (an OCR tap on the back chevron) | Kept | A window event addressed to the iPhone Mirroring window. It lands even when other windows cover the mirror. |
+| `type_text`, `press_key`, `shake`, the typing inside `launch_app` and `open_url` | Kept | One event makes the mirror the key window of its own app, without activating it; the keys are then addressed to the iPhone Mirroring process. |
+| `swipe`, `scroll_to` | Kept | Scroll events addressed to the iPhone Mirroring window. They land with the mirror fully covered and the cursor elsewhere. |
+| `drag`, `pinch`, `rotate` | Borrowed | HID events, which macOS routes to the frontmost app. iPhone Mirroring is activated for the gesture (measured: about 1 s), then the previous front app and the pointer are returned. |
+| `hold_keys`, `touch` | Taken | HID events that span the gesture or several calls. iPhone Mirroring is activated first and keeps the front afterwards. |
+
+This window path is used only on the macOS versions it was measured on (through macOS 26). On a later macOS, taps, keys and swipes are HID input and bring iPhone Mirroring to the front: on macOS 27.3 the window events were accepted and dropped, so nothing reached the iPhone ([#84](https://github.com/OllieKnight31/mirroir-mcp/issues/84)). The `windowInput` setting forces either path, and `mirroir-mcp doctor` says which one is in use.
+
+Measured on macOS 26.5 with iTerm in front and the front app sampled every 0.2s: Clock tab taps, taps with a Finder window over the whole mirror, typing, a select-all/copy/delete/paste round trip, back-to-back Spotlight launches and a launch that first had to start iPhone Mirroring all left iTerm in front throughout.
+
+### Why Gestures Still Take the Front
+
+On macOS 26.5, a drag sent as window events or window records loses its intermediate points (iOS sees a press and a release, so a drag reads as a tap). Drags and multi-step gestures therefore stay on HID input, which needs iPhone Mirroring in front. Swipes do not: measured on macOS 26.5 with iTerm in front and Finder covering the mirror, window-addressed scroll events moved App Store lists and paged Weather with the front app unchanged in every sample. A swipe that scrolls nothing with the cursor path, such as pulling the Photos grid to older photos, scrolls nothing here either. Generic macOS windows keep their activating behavior.
+
+Read-only tools (`screenshot`, `describe_screen`, `start_recording`, `stop_recording`, `status`, `get_orientation`, `check_health`, `list_skills`, `get_skill`, `list_targets`, `calibrate_component`) do **not** take the front, with no exception. When ScreenCaptureKit refuses a frame for a moment (several mirroir servers running the same binary can cause that), the capture is retried; a mirror that still cannot be captured while another app is in front returns an error instead of being brought forward.
+
+### Mitigations for Gestures
+
+| Strategy | How It Helps |
+|----------|-------------|
+| **Separate macOS Space** | Put iPhone Mirroring in its own Space. The activation triggers a Space switch, so your cursor position and text selection in the other Space are preserved. |
+| **Skill runner** | Chain multiple steps in a single skill (SKILL.md or YAML). Focus is taken once, at the first gesture, rather than between individual tool calls. |
+| **Batch your MCP work** | Run a sequence of phone interactions together, then return to your other work. |
+| **`cursor_mode: preserving`** | Coordinate tools (`tap`, `swipe`, `drag`, `long_press`, `double_tap`) accept an optional `cursor_mode` argument. `preserving` restores the cursor to its original position after a HID gesture. The default is `direct` for iPhone Mirroring and `preserving` for generic windows. This preserves cursor position, not application focus. |
+
+## Cross-Space Interaction
+
+**iPhone Mirroring** can sit on another Space. Measured on macOS 26.5: with the mirror on another Space for two minutes, a stopwatch on the phone matched wall time in every read, and taps landed without a Space switch. The same holds with the mirror fully covered by another window. Drags and two-finger gestures still activate iPhone Mirroring, which switches to its Space for the gesture.
+
+**Generic macOS windows** are driven through the cursor, so the MCP client (e.g. the terminal running the server) and the target window **must be in the same macOS Space**: AppleScript `activate` plus CGEvent cannot reach across Spaces.
+
+## Hidden and Minimized Windows
+
+Measured on macOS 26.5 with an iPhone XR:
+
+| State of the iPhone Mirroring window | What the tools report |
+|---|---|
+| App hidden (Cmd+H) | The screen can still be read: `screenshot` and `describe_screen` return live frames. Input cannot reach it: a tap and a swipe sent to the hidden window changed nothing on the iPhone. So `status` says Connected and adds that the app is hidden, and every input tool refuses, sends nothing, and asks for the app to be shown again. Keys were not measured while hidden; they are refused with the rest. |
+| Mac screen locked | Nothing can be read or sent. `status` and every input say the Mac's screen is locked and ask for it to be unlocked. After unlocking, the window may show "Mac Locked" with a Connect button to press once. |
+| Window minimized (Cmd+M) | The window is no longer the app's main window, so nothing can be read from it or sent to it. `status` says `Window minimized`, and every read and input says the window is minimized and that the user must bring it back from the Dock. |
+
+No tool brings a minimized or hidden window back: on this macOS version that takes activating the app, which mirroir does not do for you.
+
+With Stage Manager on, a window in the strip (or shown in Mission Control) is reported by the window server at its thumbnail size. Measured on macOS 26.5: 47x141 for a 430x942 window. mirroir reports the window's own frame instead, which is where the window shows once it is on stage.
+
+### Alternatives That Don't Work
+
+| Approach | Why It Fails |
+|----------|-------------|
+| Accessibility API actions | AX actions can trigger menu items (Home, App Switcher) but cannot simulate touch input on the mirrored display. The mirrored content is an opaque video surface: when mirroring is active, the window's hosting view exposes **zero** child AX elements, so the AX tree cannot read or drive iOS UI. This is why the server relies on screenshots + OCR for screen content. |
+| `NSRunningApplication.activate()` | Deprecated in macOS 14 with no replacement for cross-Space activation. Cannot reliably bring iPhone Mirroring to front. |
+
+## Keyboard Layout Gaps
+
+CGEvent keycodes are layout-independent physical keys, and the iPhone turns them into characters with its own hardware-keyboard layout. When `keyboardLayout` (or `IPHONE_KEYBOARD_LAYOUT`) names a non-US layout such as Canadian-CSA, the server reads macOS's copy of that layout (`LayoutMapper.keyTable`) and types each character with the key and Shift state that produce it there. With it empty or `US`, keystrokes come from the US QWERTY table in `CGKeyMap`.
+
+From a non-US layout, mirroir takes single keystrokes (unshifted or shifted) and dead-key pairs (`ê` is `^` then `e` on Canadian-CSA). Characters on the Option layer, and characters the layout does not have (`<`, `[`, `|` on Canadian-CSA), are pasted through the clipboard, so they depend on Universal Clipboard (see below).
+
+The setting must match the layout chosen on the iPhone. A mismatch types the wrong character rather than skipping it — with no layout set on a Canadian-CSA iPhone, `/` arrives as `é` and every URL is garbled.
+
+### iPhones with different keyboards on one Mac
+
+Nothing iPhone Mirroring exposes names the connected phone: the paired-device ID and the window ID stay the same when you switch phones. When the phones that take turns on a Mac use different hardware keyboards, list every layout (`"keyboardLayout": ["Canadian-CSA", "US"]`). A character every listed layout types with the same keys (letters, digits, most punctuation) is typed by key. Text holding a character they type with different keys (`'`, `/`, `?`, `é` between Canadian-CSA and US) is pasted through the clipboard in one run until the connected phone's layout is known, and `type_text` says so. A list needs mirroir 0.50.2 or later: older versions read a list as US.
+
+Pass `keyboard_layout` to `type_text` with the phone's layout (Settings › General › Keyboard › Hardware Keyboard on the iPhone) and those characters are typed by key. The answer is saved in `~/.mirroir-mcp/keyboard-layouts.json` under the mirroring window's size, so each phone model keeps its own answer and a switch does not ask again. The size only decides whether an answer applies: a size with no answer pastes again, and when the screen shows what another listed layout types instead (`J<arrive` for `J'arrive`), the call fails and the answer is forgotten. Two phones of the same model with different keyboards trigger that check, so they cost a question rather than a wrong character kept.
+
+### Clipboard paste is confirmed by OCR
+
+`type_text` types every character it has a key for and pastes only the runs it has none for (emoji, CJK, symbols the layout lacks), one `Cmd+V` per run. `Cmd+V` pastes the *iPhone's* clipboard; the Mac pasteboard reaches it only through Universal Clipboard (Handoff on both ends, Bluetooth and Wi-Fi, same iCloud account), asynchronously. With Handoff off nothing arrives; with a lagging sync the device pastes its previous clipboard value.
+
+So each paste is read back from the screen with local OCR before the next clipboard write: the last `pasteVerifyWindowChars` readable characters of the line — the pasted run plus the text typed just before it — must appear one more time than before the paste, within `pasteVerifyTimeoutUs`. A paste not seen stops the call with an error that names what was confirmed and what was not; the MCP tool returns `isError`, and a skill step fails. What this means in practice:
+
+- **Emoji and pictographic symbols are never confirmed.** OCR has no glyph to read for them, so a run made only of them is still pasted but the call returns an error saying it is unverified. Check the screen yourself before relying on it.
+- **Non-Latin scripts need their language requested.** OCR reads your Mac's preferred languages plus English. When the phone shows a script the Mac's languages do not cover, Vision does not read it, so a CJK paste that landed is reported as not seen. Set `ocrLanguages` (e.g. `["ja-JP","en-US"]`).
+- **Secure fields hide what was pasted.** A password field shows dots, so a paste into one cannot be confirmed; keyed characters are unaffected.
+- **The confirmed text must sit on one visible line.** A field that wraps the pasted tail across lines, or scrolls it out of view, fails the check.
+- **A mixed run is judged as a whole.** A pasted run holding both readable characters and emoji is reported unverified: a stale clipboard holding only the readable part would otherwise pass.
+
+### Spotlight can hold a previous query
+
+After an app is launched from Spotlight, iOS can reopen Spotlight still showing that query. In that state the iPhone ignores typed keys and Return — the Mac's own keyboard included — while taps still land, and on an iPhone XR (iOS 26) the keyboard stayed dead until iPhone Mirroring was quit and relaunched. Two Spotlight launches in a row hit it every time, which is exactly a `reset_app` followed by `launch`.
+
+`launch_app` (and a skill's `launch` step) therefore works like this:
+
+- It waits for Spotlight to appear, and opens it once more if a Home transition closed it.
+- When Spotlight holds a query and shows the app as a tile (its name with an app icon above it), it taps that tile instead of typing, then confirms Spotlight closed.
+- Otherwise it types the name. If the name never appears, it looks for the app's tile once more, then goes to the Home Screen route below, without pressing Return.
+- It opens the top result only when that result is an app: the "Top Hit" heading shows and either the search field reads "*name* — Open" or the result is a tile. It taps the tile when it reads one, and presses Return only when it does not. An app that is not installed has no top hit, only web suggestions and App Store rows, so the call fails and says so instead of opening one of them.
+- When Spotlight never shows the typed name (on iOS 26, Spotlight in an iPhone Mirroring session can take typing only once, while apps still take it), it presses View > Home Screen, which closes Spotlight, and taps the Home Screen icon labeled exactly with the name on the page Home shows. It never turns a page: a touch drag across the icon grid can pick up an icon and rearrange the Home Screen. Apps on another page, in a folder, in the Dock or only in the App Library are not searched; the call then fails, says so, and leaves the phone on the Home Screen.
+
+A held query for a *different* app takes the same Home Screen route.
+
+## Web and iOS Scenarios
+
+A `mirroir-run` scenario can hold a web block and an iOS block ([Web and iOS in one scenario](web-and-ios.md)), with these limits:
+
+- An iOS block needs macOS, iPhone Mirroring connected, and `mirroir-mcp`; on Linux it is refused by name.
+- The two blocks run one after the other, not in parallel, and a scenario opens at most one block per surface.
+- `cross_surface` compares token overlap, not meaning: two screens that say the same thing in different words score low.
+
+## Modifier-State Corruption (Apple Bug)
+
+iPhone Mirroring can intermittently corrupt modifier state, producing alternating-case output (`LiKe ThIs`) regardless of the input source — Mac keyboard, CGEvent, or otherwise. The same bug is [documented for Universal Control](https://discussions.apple.com/thread/254551671). The server sends correct modifiers for every keystroke; this is an Apple-side defect, not a mirroir bug. Workarounds: toggle Caps Lock, disconnect/reconnect iPhone Mirroring, or reboot the Mac.
+
+## No On-Screen Keyboard
+
+iPhone Mirroring acts as an external hardware keyboard, so iOS hides the virtual on-screen keyboard. There is no iOS setting to override this — it is a hard platform limitation.
+
+### Impact on Testing
+
+- Screenshots and OCR will never show the iOS keyboard. Tests that need to verify keyboard appearance, custom input accessories, or keyboard-driven UI cannot be validated through iPhone Mirroring.
+- Text input itself works fine — `type_text` and `press_key` deliver keystrokes via CGEvent regardless of whether the virtual keyboard is visible.
+
+## iOS Autocorrect
+
+iOS applies autocorrect to typed text the same way it does for physical keyboard input. Words may be silently changed after a space or punctuation is typed. Disable autocorrect in iPhone **Settings > General > Keyboard** if this causes issues.

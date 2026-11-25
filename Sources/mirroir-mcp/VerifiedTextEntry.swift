@@ -1,0 +1,245 @@
+/*
+ * Copyright 2026 Async-IO.org
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License"); you may not
+ * use this file except in compliance with the License. You may obtain a copy of
+ * the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ */
+// ABOUTME: Enters segmented text — keystrokes for keyed runs, one clipboard paste per unmappable run.
+// ABOUTME: Each paste is confirmed on screen by OCR before the next write; keyed text is read back for autocorrect.
+
+import Foundation
+import HelperLib
+
+/// Enters text segment by segment and refuses to report a paste it did not see.
+///
+/// Keyed runs are posted as keystrokes, which are self-contained. Unmappable
+/// runs (emoji, CJK, characters the iPhone's layout lacks) go through Universal
+/// Clipboard, which can deliver nothing — Handoff off — or the device's
+/// previous clipboard value when the sync lags. Two clipboard writes in one call
+/// race each other through that asynchronous sync, so a second paste is only
+/// safe once the first is known to have landed. Every paste is therefore read
+/// back from the screen: the entry waits until the pasted run's tail (with the
+/// characters typed just before it) appears one more time than it did before
+/// the paste. A paste not seen within `verifyTimeoutUs` — or one that has no
+/// OCR-readable character to look for — stops the entry with an error naming
+/// what was and was not confirmed.
+struct VerifiedTextEntry {
+    /// Posts keystrokes for a keyed run. Nil on success, the failure otherwise.
+    let typeKeys: (String) -> TypeResult?
+    /// Writes a run to the pasteboard, waits for the sync, and presses Cmd+V.
+    let paste: (String) -> TypeResult
+    /// Reads every text line on screen once. Nil when the screen cannot be read.
+    let readScreen: () -> [String]?
+    /// Sleeps for the given number of microseconds between screen reads.
+    let sleep: (UInt32) -> Void
+    /// Longest wait for a paste to appear on screen (microseconds).
+    let verifyTimeoutUs: UInt32
+    /// Gap between screen reads while waiting for a paste (microseconds).
+    let verifyPollUs: UInt32
+    /// Trailing characters of entered text that must appear on screen.
+    let windowChars: Int
+
+    /// Enter every segment in order. Success only when every keyed run was
+    /// posted and every pasted run was seen on screen.
+    func enter(_ segments: [InputSimulation.TypeSegment], misreadings: [String] = []) -> TypeResult {
+        let keyedOnly = segments.allSatisfy { $0.method == .keyEvent }
+        // What the screen held before any key, so the read-back counts only
+        // text the keys added: the typed word is often on screen already (an
+        // icon label behind Spotlight, a search result).
+        let before = keyedOnly ? readScreen() : nil
+        var entered = ""
+        for (index, segment) in segments.enumerated() {
+            let remaining = segments[index...].map(\.text).joined()
+            switch segment.method {
+            case .keyEvent:
+                if let failure = typeKeys(segment.text) {
+                    return Self.failure(failure.error ?? "Keystroke failed",
+                                        entered: entered, remaining: remaining)
+                }
+                entered += segment.text
+            case .paste:
+                if let error = pasteAndVerify(segment.text, after: entered) {
+                    return Self.failure(error, entered: entered, remaining: remaining)
+                }
+                entered += segment.text
+            }
+        }
+        guard keyedOnly else { return TypeResult(success: true, error: nil) }
+        let readBack = keyedReadBack(entered, before: before ?? [], misreadings: misreadings)
+        return TypeResult(success: true, error: nil, notice: readBack.notice,
+                          misreadingShown: readBack.misread)
+    }
+
+    /// Read typed text back from the screen. iOS autocorrect rewrites keystrokes
+    /// at each word boundary ("teh" becomes "the" in Notes), so the field can
+    /// hold other text than was typed. The text counts as shown when its
+    /// readable characters appear in the screen's lines read in order, which
+    /// keeps a line the field wrapped whole, more often than in `before`, the
+    /// read taken before the first key: text already on screen proves nothing.
+    /// Nil when it is shown, when it has nothing OCR could read, or when the
+    /// screen cannot be read at all; otherwise a notice saying what was not
+    /// seen. It is a notice, not a failure: every keystroke was posted, and a
+    /// password field shows dots. `misread` says the screen newly shows one
+    /// of `misreadings` instead: what the keys type on another keyboard layout.
+    private func keyedReadBack(
+        _ typed: String, before: [String], misreadings: [String]
+    ) -> (notice: String?, misread: Bool) {
+        let needle = PasteNeedle.readable(typed, foldingCase: false)
+        guard !needle.isEmpty else { return (nil, false) }
+        let shownBefore = PasteNeedle.readable(before.joined(), foldingCase: false)
+        let exactBefore = PasteNeedle.count(needle, in: shownBefore)
+        let foldedBefore = PasteNeedle.count(needle.lowercased(), in: shownBefore.lowercased())
+        let misneedles = misreadings.map { PasteNeedle.readable($0) }.filter { !$0.isEmpty }
+        let misBefore = misneedles.map { PasteNeedle.count($0, in: shownBefore.lowercased()) }
+        var screenRead = false
+        var recased = false
+        var misread = false
+        for _ in 0 ..< Self.readBackReads {
+            sleep(verifyPollUs)
+            guard let lines = readScreen() else { continue }
+            screenRead = true
+            let shown = PasteNeedle.readable(lines.joined(), foldingCase: false)
+            if PasteNeedle.count(needle, in: shown) > exactBefore { return (nil, false) }
+            recased = recased
+                || PasteNeedle.count(needle.lowercased(), in: shown.lowercased()) > foldedBefore
+            misread = misread || zip(misneedles, misBefore).contains { mis, before in
+                PasteNeedle.count(mis, in: shown.lowercased()) > before
+            }
+        }
+        guard screenRead else { return (nil, false) }
+        if recased {
+            return ("Every keystroke was sent, but the iPhone changed the capitalization of "
+                + "\"\(typed)\" (it capitalizes the start of a sentence, for example). Read the "
+                + "field if the exact case matters.", false)
+        }
+        return ("Every keystroke was sent, but \"\(typed)\" is not what the screen shows. " +
+            "The iPhone may have autocorrected it (for example \"teh\" to \"the\", or " +
+            "English words rewritten by a French keyboard); read the field before relying " +
+            "on its text. A password field hides what it holds, so this notice is " +
+            "expected there.", misread)
+    }
+
+    /// Screen reads the keyed read-back makes, each after one `verifyPollUs` gap.
+    /// Autocorrect rewrites a word as its boundary is typed, so nothing arrives
+    /// late but the mirrored frame: the second read covers a frame the first
+    /// came too early for. Each read is a full OCR pass, so a mismatch costs
+    /// two of them rather than a poll over the whole paste timeout.
+    static let readBackReads = 2
+
+    /// Paste one run and wait until it is on screen. Nil when seen, the reason otherwise.
+    private func pasteAndVerify(_ run: String, after entered: String) -> String? {
+        guard let needle = PasteNeedle.make(entered: entered, run: run,
+                                            windowChars: windowChars) else {
+            let result = paste(run)
+            guard result.success else { return result.error ?? "Cmd+V paste failed" }
+            return "\(run.count) character(s) were pasted through the clipboard but " +
+                "OCR cannot read them back (the run holds emoji or symbols with no " +
+                "readable text), " +
+                "so their delivery is unverified and not reported as success. " +
+                "Check the screen before relying on them."
+        }
+        guard let before = readScreen() else {
+            return "Could not read the screen before pasting, so the paste could not be verified"
+        }
+        let baseline = PasteNeedle.occurrences(of: needle, in: before)
+
+        let result = paste(run)
+        guard result.success else { return result.error ?? "Cmd+V paste failed" }
+
+        let attempts = max(1, Int(verifyTimeoutUs / max(1, verifyPollUs)))
+        for _ in 0 ..< attempts {
+            sleep(verifyPollUs)
+            if let lines = readScreen(),
+               PasteNeedle.occurrences(of: needle, in: lines) > baseline {
+                return nil
+            }
+        }
+        let seconds = Double(verifyTimeoutUs) / 1_000_000
+        return "\(run.count) character(s) pasted with Cmd+V were not seen on screen " +
+            "within \(seconds)s. The clipboard path needs Universal Clipboard (Handoff " +
+            "on the Mac and the iPhone, Bluetooth and Wi-Fi on, same iCloud account); " +
+            "a lagging sync pastes the device's previous clipboard instead. Non-Latin " +
+            "scripts are only readable when OCR reads their language: the Mac's " +
+            "preferred languages, or `ocrLanguages` when set."
+    }
+
+    /// A failure naming what was confirmed delivered and what was not.
+    private static func failure(_ reason: String, entered: String,
+                                remaining: String) -> TypeResult {
+        TypeResult(
+            success: false,
+            error: "\(reason) — confirmed \(entered.count) character(s) \"\(entered)\"; " +
+                "not confirmed: \"\(remaining)\".")
+    }
+}
+
+/// The on-screen evidence a paste must produce, and how to count it.
+enum PasteNeedle {
+
+    /// The text to look for once `run` is pasted after `entered`: the last
+    /// `windowChars` OCR-readable characters of the current line, ending with
+    /// the run's own last readable character. Nil when any visible character of
+    /// the run is unreadable: a stale clipboard holding only the readable part
+    /// would match, so nothing on screen could prove the whole run arrived.
+    static func make(entered: String, run: String, windowChars: Int) -> String? {
+        let runReadable = readable(run)
+        let visible = run.filter { !$0.isWhitespace && !$0.isNewline }
+        guard !runReadable.isEmpty, runReadable.count == visible.count else { return nil }
+        let currentLine = entered.split(separator: "\n", omittingEmptySubsequences: false)
+            .last.map(String.init) ?? ""
+        let line = readable(currentLine) + runReadable
+        return String(line.suffix(max(windowChars, 1)))
+    }
+
+    /// Whether `text` appears in `after` more often than in `before`. False when
+    /// `text` has no readable character, since nothing on screen could show it.
+    static func appearedAgain(_ text: String, before: [String], after: [String]) -> Bool {
+        let needle = readable(text)
+        guard !needle.isEmpty else { return false }
+        return occurrences(of: needle, in: after) > occurrences(of: needle, in: before)
+    }
+
+    /// How many times `needle` appears in `text`, both already normalized.
+    static func count(_ needle: String, in text: String) -> Int {
+        text.components(separatedBy: needle).count - 1
+    }
+
+    /// How many times `needle` appears across `lines`, each line normalized
+    /// the same way as the needle.
+    static func occurrences(of needle: String, in lines: [String]) -> Int {
+        lines.reduce(0) { total, line in
+            total + readable(line).components(separatedBy: needle).count - 1
+        }
+    }
+
+    /// Text without the characters OCR cannot be trusted to report: whitespace
+    /// (recognition inserts and drops spaces), control characters, and emoji or
+    /// pictographic symbols (no recognizable glyph). Lowercased unless
+    /// `foldingCase` is false, which keeps the case for the keyed read-back:
+    /// iOS capitalizes what it is typed, and only the case tells.
+    static func readable(_ text: String, foldingCase: Bool = true) -> String {
+        String((foldingCase ? text.lowercased() : text).filter(isReadable))
+    }
+
+    private static func isReadable(_ character: Character) -> Bool {
+        if character.isWhitespace || character.isNewline { return false }
+        return !character.unicodeScalars.contains { scalar in
+            scalar.properties.generalCategory == .control
+                || scalar.properties.generalCategory == .format
+                || (scalar.properties.isEmoji && scalar.value > latin1Max)
+        }
+    }
+
+    /// Last Latin-1 code point. Above it, an emoji-capable scalar (😀, ™, ↔) is
+    /// a pictograph; within it, `#`, digits, `©` and `®` are ordinary text.
+    private static let latin1Max: UInt32 = 0xFF
+}

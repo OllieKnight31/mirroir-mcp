@@ -1,0 +1,104 @@
+/*
+ * Copyright 2026 Async-IO.org
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License"); you may not
+ * use this file except in compliance with the License. You may obtain a copy of
+ * the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ */
+// ABOUTME: Fuzzy text matching against OCR-detected screen elements.
+// ABOUTME: Used by the test runner to find tap targets and assert element visibility.
+
+import Foundation
+import HelperLib
+
+/// Matches a text label against OCR-detected TapPoint elements.
+/// Match priority: exact → case-insensitive → diacritic-insensitive → substring
+/// (case-insensitive) → substring ignoring case and accents, the way
+/// describe_screen's query matches.
+enum ElementMatcher {
+
+    /// Result of a match attempt, including which strategy succeeded.
+    struct MatchResult {
+        let element: TapPoint
+        let strategy: MatchStrategy
+    }
+
+    /// How the match was found.
+    enum MatchStrategy: String {
+        case exact = "exact"
+        case caseInsensitive = "case-insensitive"
+        case diacriticInsensitive = "diacritic-insensitive"
+        case substring = "substring"
+    }
+
+    /// Find the best matching element for the given label.
+    /// Returns nil if no match is found. Among elements matched by the same
+    /// strategy, the one nearest `anchor` wins when given (a compiled tap passes
+    /// its recorded spot, so a tab label is not mistaken for a page title with
+    /// the same text); otherwise the first one in reading order.
+    static func findMatch(label: String, in elements: [TapPoint],
+                          nearestTo anchor: (x: Double, y: Double)? = nil) -> MatchResult? {
+        guard !label.isEmpty, !elements.isEmpty else { return nil }
+
+        let lowerLabel = label.lowercased()
+        let foldedLabel = fold(label)
+        // Reverse substring requires the element text to cover at least half the
+        // label length (minimum 3 characters) to avoid false matches on short OCR fragments.
+        let minReverseLength = max(3, lowerLabel.count / 2)
+
+        // Priority order: exact → case-insensitive → diacritic-insensitive ("Résumé"
+        // matches "Resume") → substring (label contained in element text) → reverse
+        // substring (element text contained in label) → both substrings again with
+        // accents folded: OCR drops or adds an accent on a line that holds more
+        // than the label ("Epicerie 3" for a row "Épicerie" with its count).
+        let tiers: [(MatchStrategy, (TapPoint) -> Bool)] = [
+            (.exact, { $0.text == label }),
+            (.caseInsensitive, { $0.text.lowercased() == lowerLabel }),
+            (.diacriticInsensitive, { fold($0.text) == foldedLabel }),
+            (.substring, { $0.text.lowercased().contains(lowerLabel) }),
+            (.substring, {
+                let lower = $0.text.lowercased()
+                return lower.count >= minReverseLength && lowerLabel.contains(lower)
+            }),
+            (.substring, { fold($0.text).contains(foldedLabel) }),
+            (.substring, {
+                let folded = fold($0.text)
+                return folded.count >= minReverseLength && foldedLabel.contains(folded)
+            }),
+        ]
+        for (strategy, matches) in tiers {
+            let candidates = elements.filter(matches)
+            guard let first = candidates.first else { continue }
+            guard let anchor else { return MatchResult(element: first, strategy: strategy) }
+            let nearest = candidates.min { lhs, rhs in
+                distanceSquared(lhs, anchor) < distanceSquared(rhs, anchor)
+            } ?? first
+            return MatchResult(element: nearest, strategy: strategy)
+        }
+        return nil
+    }
+
+    /// `text` without case or accents, as the diacritic-insensitive tier compares.
+    private static func fold(_ text: String) -> String {
+        text.folding(options: [.diacriticInsensitive, .caseInsensitive], locale: nil)
+    }
+
+    private static func distanceSquared(_ element: TapPoint, _ anchor: (x: Double, y: Double)) -> Double {
+        let dx = element.tapX - anchor.x
+        let dy = element.tapY - anchor.y
+        return dx * dx + dy * dy
+    }
+
+    /// Check whether a label is visible on screen (any match strategy).
+    static func isVisible(label: String, in elements: [TapPoint]) -> Bool {
+        findMatch(label: label, in: elements) != nil
+    }
+}

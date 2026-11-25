@@ -1,0 +1,64 @@
+name: "CI: Limitation Register"
+
+# The register gates run at pre-push (Tier 1), but a local hook only protects
+# the person who has it installed — a contributor PR or a push from another
+# machine reaches main ungated. This runs the same gates in CI, with no Swift
+# or Rust build: ripgrep over the sources, seconds not minutes.
+#
+# What it enforces: deferral prose ("is the follow-up", "not yet wired") is
+# banned unless the line carries a LIMITATION(registre#n) marker naming the
+# limited item and pointing at an issue in jfarcand/mirroir-carnet; the
+# 500-line file cap; inline clippy allows outside the declared list; and
+# feature-phases.yaml stays parseable. See .registre/README.md.
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '**.swift'
+      - '**.rs'
+      - '**.ts'
+      - '**.tsx'
+      - '**.js'
+      - '**.mjs'
+      - 'registre.toml'
+      - 'feature-phases.yaml'
+      - '.registre'
+      - '.github/workflows/limitation-register.yml'
+  pull_request:
+    paths:
+      - '**.swift'
+      - '**.rs'
+      - '**.ts'
+      - '**.tsx'
+      - '**.js'
+      - '**.mjs'
+      - 'registre.toml'
+      - 'feature-phases.yaml'
+      - '.registre'
+      - '.github/workflows/limitation-register.yml'
+
+# Cancel superseded runs on the same branch / PR — never on main or a tag,
+# where each commit keeps its own complete run.
+concurrency:
+  # On main every commit keeps its own run: a third push must not replace a queued second one.
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}${{ github.ref == 'refs/heads/main' && format('-{0}', github.sha) || '' }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' && !startsWith(github.ref, 'refs/tags/') }}
+
+permissions:
+  contents: read
+
+jobs:
+  limitation-register:
+    name: Limitation Register Gates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # The gates live in the .registre submodule.
+          submodules: true
+
+      - name: Install ripgrep
+        run: sudo apt-get update && sudo apt-get install -y ripgrep
+
+      - name: Run the limitation register gates
+        run: ./.registre/limitation-gates.sh

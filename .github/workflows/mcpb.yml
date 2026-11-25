@@ -1,0 +1,90 @@
+name: "CI: MCP Bundle and Plugin Manifests"
+
+# Guards the one-line install artifacts: the Claude Code plugin marketplace
+# (.claude-plugin/marketplace.json + plugins/mirroir) and the MCP Bundle
+# manifest (mcpb/manifest.json). release.yml packs mirroir-mcp.mcpb and
+# attaches it when it creates each release; releases are immutable, so a
+# published release cannot gain the bundle afterwards.
+on:
+  push:
+    paths:
+      - '.claude-plugin/**'
+      - 'plugins/**'
+      - 'mcpb/**'
+      - 'server.json'
+      - '.github/workflows/mcpb.yml'
+  pull_request:
+    paths:
+      - '.claude-plugin/**'
+      - 'plugins/**'
+      - 'mcpb/**'
+      - 'server.json'
+      - '.github/workflows/mcpb.yml'
+  workflow_dispatch:
+
+# Cancel superseded runs on the same branch / PR — never on main or a tag,
+# where each commit keeps its own complete run.
+concurrency:
+  # On main every commit keeps its own run: a third push must not replace a queued second one.
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}${{ github.ref == 'refs/heads/main' && format('-{0}', github.sha) || '' }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' && !startsWith(github.ref, 'refs/tags/') }}
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+
+      - name: Manifests parse as JSON
+        run: |
+          for f in .claude-plugin/marketplace.json plugins/mirroir/.claude-plugin/plugin.json mcpb/manifest.json plugins/hermes/plugin.json plugins/hermes/mcp.json plugins/openclaw/openclaw.plugin.json plugins/openclaw/package.json plugins/openclaw/read-only-tools.json; do
+            python3 -I -m json.tool "$f" > /dev/null
+            echo "ok: $f"
+          done
+
+      - name: Plugin version and npx pin match server.json
+        run: |
+          python3 -I - <<'EOF'
+          import json, sys
+          expected = json.load(open("server.json"))["version"]
+          plugin = json.load(open("plugins/mirroir/.claude-plugin/plugin.json"))
+          found = plugin["version"]
+          if found != expected:
+              sys.exit(f"plugin.json version {found} != server.json version {expected}")
+          args = plugin["mcpServers"]["mirroir"]["args"]
+          pin = f"mirroir-mcp@{expected}"
+          if pin not in args:
+              sys.exit(f"plugin.json args {args} do not pin {pin}")
+          print(f"plugin.json version and npx pin match {expected}")
+          hermes = json.load(open("plugins/hermes/plugin.json"))
+          if hermes["version"] != expected:
+              sys.exit(f"plugins/hermes/plugin.json version {hermes['version']} != server.json version {expected}")
+          hermes_args = json.load(open("plugins/hermes/mcp.json"))["mcpServers"]["mirroir"]["args"]
+          if pin not in hermes_args:
+              sys.exit(f"plugins/hermes/mcp.json args {hermes_args} do not pin {pin}")
+          print(f"plugins/hermes version and npx pin match {expected}")
+          claw = json.load(open("plugins/openclaw/openclaw.plugin.json"))
+          claw_package = json.load(open("plugins/openclaw/package.json"))
+          for name, found in (("openclaw.plugin.json", claw["version"]), ("package.json", claw_package["version"])):
+              if found != expected:
+                  sys.exit(f"plugins/openclaw/{name} version {found} != server.json version {expected}")
+          claw_args = claw["mcpServers"]["mirroir"]["args"]
+          if pin not in claw_args:
+              sys.exit(f"plugins/openclaw/openclaw.plugin.json args {claw_args} do not pin {pin}")
+          print(f"plugins/openclaw version and npx pin match {expected}")
+          EOF
+
+      - name: OpenClaw approval gate tests
+        working-directory: plugins/openclaw
+        run: node --test
+
+      - name: MCPB manifest validates
+        run: mcpb/build-mcpb.sh --check

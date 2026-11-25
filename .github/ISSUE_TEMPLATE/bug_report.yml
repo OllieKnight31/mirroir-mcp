@@ -1,0 +1,100 @@
+name: Bug Report
+description: Report a bug with mirroir-mcp
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. Two things make a report actionable: the output of `doctor --json`, and what the phone actually showed. Remove anything private (names, messages, codes) before you paste.
+
+  - type: dropdown
+    id: target
+    attributes:
+      label: Target
+      description: What is mirroir driving?
+      options:
+        - iPhone through iPhone Mirroring
+        - A macOS window (generic target)
+    validations:
+      required: true
+
+  - type: dropdown
+    id: install-method
+    attributes:
+      label: Install method
+      options:
+        - npx (`npx -y mirroir-mcp`)
+        - Homebrew (`brew install jfarcand/tap/mirroir-mcp`)
+        - curl installer (`get-mirroir.sh`)
+        - MCP Bundle (`mirroir-mcp.mcpb`)
+        - Source (`swift build`)
+    validations:
+      required: true
+
+  - type: textarea
+    id: doctor
+    attributes:
+      label: Output of doctor
+      description: |
+        Run `npx -y mirroir-mcp doctor --json` (or `mirroir-mcp doctor --json`) and paste everything it prints.
+        It names the mirroir version, the macOS version and the result of each check, with the fix it suggests for any that fail.
+      render: json
+    validations:
+      required: true
+
+  - type: input
+    id: device-info
+    attributes:
+      label: iPhone and iOS version
+      description: Leave empty for a macOS window target.
+      placeholder: "iPhone 15 Pro, iOS 26.1"
+    validations:
+      required: false
+
+  - type: input
+    id: mcp-client
+    attributes:
+      label: MCP client
+      description: The app that runs mirroir, with its version if you know it.
+      placeholder: "Claude Code 2.1 / Cursor / Codex / Claude Desktop / OpenClaw / other"
+    validations:
+      required: true
+
+  - type: textarea
+    id: asked
+    attributes:
+      label: What you asked for
+      description: The prompt, or the tool calls in order with their arguments.
+      placeholder: |
+        1. launch_app(name: "Weather")
+        2. tap(text: "Tomorrow")
+    validations:
+      required: true
+
+  - type: textarea
+    id: observed
+    attributes:
+      label: What the iPhone showed
+      description: |
+        What you saw on the phone or in the iPhone Mirroring window after each step, and what the tool replied.
+        "The tap returned success but the screen did not change" is a useful answer. A screenshot helps.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+    validations:
+      required: true
+
+  - type: textarea
+    id: debug-log
+    attributes:
+      label: Debug log
+      description: |
+        Start the server with `--debug` (or `MIRROIR_DEBUG=1`; in the Claude extension, turn on its "Debug logging" option and reopen Claude), reproduce, then paste the matching lines of `~/.mirroir-mcp/debug.log`. Several servers can share the file: each line names its process (`pid 1234]`), so paste the lines of the server that failed.
+      render: text
+    validations:
+      required: false

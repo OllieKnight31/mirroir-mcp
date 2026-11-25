@@ -1,0 +1,398 @@
+/*
+ * Copyright 2026 Async-IO.org
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License"); you may not
+ * use this file except in compliance with the License. You may obtain a copy of
+ * the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ */
+// ABOUTME: Tests for StepExecutor: each core step type with stub subsystems.
+// ABOUTME: Validates launch, tap, type, assertions, navigation, dry run, and target switching.
+
+import XCTest
+@testable import HelperLib
+@testable import mirroir_mcp
+
+final class StepExecutorTests: XCTestCase {
+
+    var bridge: StubBridge!
+    var input: StubInput!
+    var describer: StubDescriber!
+    var capture: StubCapture!
+    var executor: StepExecutor!
+
+    override func setUp() {
+        super.setUp()
+        bridge = StubBridge()
+        input = StubInput()
+        describer = StubDescriber()
+        capture = StubCapture()
+
+        let config = StepExecutorConfig(
+            waitForTimeoutSeconds: 2,
+            settlingDelayMs: 0,  // No delay in tests
+            screenshotDir: NSTemporaryDirectory() + "test-screenshots-\(UUID().uuidString)",
+            dryRun: false
+        )
+        executor = StepExecutor(
+            bridge: bridge, input: input,
+            describer: describer, capture: capture,
+            config: config
+        )
+    }
+
+    // MARK: - Launch
+
+    func testACoordinateOnlyTapRunLiveSaysWhyItCannot() {
+        let result = executor.execute(step: .tap(label: ""), stepIndex: 0, skillName: "test")
+        XCTAssertEqual(result.status, .failed)
+        XCTAssertTrue(result.message?.contains("recorded by coordinates") ?? false,
+                      result.message ?? "")
+        XCTAssertTrue(input.tapCalls.isEmpty)
+    }
+
+    func testLaunchSuccess() {
+        input.launchAppResult = nil  // nil = success
+        let result = executor.execute(
+            step: .launch(appName: "Settings"), stepIndex: 0, skillName: "test")
+        XCTAssertEqual(result.status, .passed)
+    }
+
+    func testLaunchFailure() {
+        input.launchAppResult = "App not found"
+        let result = executor.execute(
+            step: .launch(appName: "NonExistent"), stepIndex: 0, skillName: "test")
+        XCTAssertEqual(result.status, .failed)
+        XCTAssertEqual(result.message, "App not found")
+    }
+
+    /// carnet#27: a launch that leaves Spotlight up opened nothing, and the
+    /// replay says so instead of passing the step.
+    func testALaunchThatLeavesSpotlightOpenFails() {
+        input.launchAppResult = nil
+        bridge.windowInfo = WindowInfo(windowID: 1, position: .zero,
+                                       size: CGSize(width: 430, height: 942), pid: 1)
+        describer.describeResult = ScreenDescriber.DescribeResult(elements: [
+            TapPoint(text: "Meilleur résultat", tapX: 86, tapY: 107, confidence: 0.9),
+            TapPoint(text: "Q Horloge - Ouvrir", tapX: 133, tapY: 874, confidence: 0.9),
+        ], screenshotBase64: "img")
+        let result = executor.execute(
+            step: .launch(appName: "Horloge"), stepIndex: 0, skillName: "test")
+        XCTAssertEqual(result.status, .failed)
+        XCTAssertTrue(result.message?.contains("Spotlight is still open") ?? false, result.message ?? "")
+    }
+
+    // MARK: - Tap
+
+    func testTapSuccess() {
+        describer.describeResult = ScreenDescriber.DescribeResult(
+            elements: [TapPoint(text: "General", tapX: 100, tapY: 200, confidence: 0.95)],
+            screenshotBase64: ""
+        )
+        input.tapResult = nil  // nil = success
+
+        let result = executor.execute(
+            step: .tap(label: "General"), stepIndex: 0, skillName: "test")
+        XCTAssertEqual(result.status, .passed)
+    }
+
+    func testTapElementNotFound() {
+        describer.describeResult = ScreenDescriber.DescribeResult(
+            elements: [TapPoint(text: "About", tapX: 100, tapY: 200, confidence: 0.95)],
+            screenshotBase64: ""
+        )
+
+        let result = executor.execute(
+            step: .tap(label: "General"), stepIndex: 0, skillName: "test")
+        XCTAssertEqual(result.status, .failed)
+        XCTAssertTrue(result.message?.contains("not found") ?? false)
+    }
+
+    func testTapOCRFailed() {
+        describer.describeResult = nil
+
+        let result = executor.execute(
+            step: .tap(label: "General"), stepIndex: 0, skillName: "test")
+        XCTAssertEqual(result.status, .failed)
+        XCTAssertTrue(result.message?.contains("OCR") ?? false)
+    }
+
+    // MARK: - Type
+
+    func testTypeSuccess() {
+        input.typeTextResult = TypeResult(success: true, error: nil)
+        let result = executor.execute(
+            step: .type(text: "Hello"), stepIndex: 0, skillName: "test")
+        XCTAssertEqual(result.status, .passed)
+    }
+
+    func testTypeFailure() {
+        input.typeTextResult = TypeResult(success: false, error: "Helper unavailable")
+        let result = executor.execute(
+            step: .type(text: "Hello"), stepIndex: 0, skillName: "test")
+        XCTAssertEqual(result.status, .failed)
+    }
+
+    // MARK: - Clear Field
+
+    func testClearFieldSelectsAllThenDeletes() {
+        let step = SkillParser.parseStep("clear_field")
+        guard case .clearField = step else {
+            return XCTFail("clear_field parsed as \(String(describing: step))")
+        }
+        let result = executor.execute(step: .clearField, stepIndex: 0, skillName: "test")
+        XCTAssertEqual(result.status, .passed)
+        XCTAssertEqual(input.pressKeyCalls, ["command+a", "delete"])
+    }
+
+    func testClearFieldFailsWhenTheKeyIsNotDelivered() {
+        input.pressKeyResult = TypeResult(success: false, error: "key dropped")
+        let result = executor.execute(step: .clearField, stepIndex: 0, skillName: "test")
+        XCTAssertEqual(result.status, .failed)
+        XCTAssertEqual(input.pressKeyCalls, ["command+a"], "nothing deleted after a failed select-all")
+    }
+
+    func testClearFieldRoundTripsThroughItsCompiledTypeKey() {
+        let rebuilt = SkillParser.parseStep(key: SkillStep.clearField.typeKey, rawValue: "")
+        guard case .clearField = rebuilt else {
+            return XCTFail("compiled clear_field rebuilt as \(rebuilt)")
+        }
+        XCTAssertNil(SkillStep.clearField.replayValue)
+    }
+
+    // MARK: - Press Key
+
+    func testPressKeySuccess() {
+        input.pressKeyResult = TypeResult(success: true, error: nil)
+        let result = executor.execute(
+            step: .pressKey(keyName: "return", modifiers: []),
+            stepIndex: 0, skillName: "test")
+        XCTAssertEqual(result.status, .passed)
+    }
+
+    // MARK: - Assert Visible
+
+    func testAssertVisiblePass() {
+        describer.describeResult = ScreenDescriber.DescribeResult(
+            elements: [TapPoint(text: "Model Name", tapX: 100, tapY: 200, confidence: 0.95)],
+            screenshotBase64: ""
+        )
+
+        let result = executor.execute(
+            step: .assertVisible(label: "Model Name"), stepIndex: 0, skillName: "test")
+        XCTAssertEqual(result.status, .passed)
+    }
+
+    func testAssertVisibleFail() {
+        describer.describeResult = ScreenDescriber.DescribeResult(
+            elements: [TapPoint(text: "Other", tapX: 100, tapY: 200, confidence: 0.95)],
+            screenshotBase64: ""
+        )
+
+        let result = executor.execute(
+            step: .assertVisible(label: "Model Name"), stepIndex: 0, skillName: "test")
+        XCTAssertEqual(result.status, .failed)
+    }
+
+    // MARK: - Assert Not Visible
+
+    func testAssertNotVisiblePass() {
+        describer.describeResult = ScreenDescriber.DescribeResult(
+            elements: [TapPoint(text: "General", tapX: 100, tapY: 200, confidence: 0.95)],
+            screenshotBase64: ""
+        )
+
+        let result = executor.execute(
+            step: .assertNotVisible(label: "Error"), stepIndex: 0, skillName: "test")
+        XCTAssertEqual(result.status, .passed)
+    }
+
+    func testAssertNotVisibleFail() {
+        describer.describeResult = ScreenDescriber.DescribeResult(
+            elements: [TapPoint(text: "Error", tapX: 100, tapY: 200, confidence: 0.95)],
+            screenshotBase64: ""
+        )
+
+        let result = executor.execute(
+            step: .assertNotVisible(label: "Error"), stepIndex: 0, skillName: "test")
+        XCTAssertEqual(result.status, .failed)
+    }
+
+    // MARK: - Home
+
+    func testHomeSuccess() {
+        bridge.menuActionResult = true
+        let result = executor.execute(
+            step: .home, stepIndex: 0, skillName: "test")
+        XCTAssertEqual(result.status, .passed)
+    }
+
+    func testHomeFailure() {
+        bridge.menuActionResult = false
+        let result = executor.execute(
+            step: .home, stepIndex: 0, skillName: "test")
+        XCTAssertEqual(result.status, .failed)
+    }
+
+    /// A screen Home leaves unchanged (most likely the Home Screen in a
+    /// language whose search pill is not listed) passes, saying so.
+    func testHomeThatLeavesTheScreenUnchangedPassesWithANote() {
+        bridge.menuActionResult = true
+        describer.describeResult = ScreenDescriber.DescribeResult(
+            elements: [TapPoint(text: "Notizen", tapX: 166, tapY: 499, confidence: 0.9)],
+            screenshotBase64: "img")
+        let result = executor.execute(
+            step: .home, stepIndex: 0, skillName: "test")
+        XCTAssertEqual(result.status, .passed)
+        XCTAssertTrue(result.message?.contains("the screen did not change") ?? false,
+                      result.message ?? "")
+    }
+
+    // MARK: - Shake
+
+    func testShakeSuccess() {
+        input.shakeResult = TypeResult(success: true, error: nil)
+        let result = executor.execute(
+            step: .shake, stepIndex: 0, skillName: "test")
+        XCTAssertEqual(result.status, .passed)
+    }
+
+    // MARK: - Open URL
+
+    func testOpenURLSuccess() {
+        input.openURLResult = nil  // nil = success
+        let result = executor.execute(
+            step: .openURL(url: "https://example.com"), stepIndex: 0, skillName: "test")
+        XCTAssertEqual(result.status, .passed)
+    }
+
+    // MARK: - Swipe
+
+    func testSwipeSuccess() {
+        input.swipeResult = nil  // nil = success
+        let result = executor.execute(
+            step: .swipe(direction: "up"), stepIndex: 0, skillName: "test")
+        XCTAssertEqual(result.status, .passed)
+    }
+
+    func testSwipeInvalidDirection() {
+        let result = executor.execute(
+            step: .swipe(direction: "diagonal"), stepIndex: 0, skillName: "test")
+        XCTAssertEqual(result.status, .failed)
+        XCTAssertTrue(result.message?.contains("Unknown swipe direction") ?? false)
+    }
+
+    // MARK: - Skipped
+
+    func testSkippedStep() {
+        let result = executor.execute(
+            step: .skipped(stepType: "drag", reason: "Missing from/to labels"),
+            stepIndex: 0, skillName: "test")
+        XCTAssertEqual(result.status, .skipped)
+    }
+
+    func testAIOnlyStepIsNotEvaluated() {
+        let result = executor.execute(
+            step: .skipped(stepType: "remember", reason: "AI-only"),
+            stepIndex: 0, skillName: "test")
+        XCTAssertEqual(result.status, .notEvaluated)
+        XCTAssertEqual(result.message, "not evaluated: remember needs an AI client")
+    }
+
+    // MARK: - Dry Run
+
+    func testDryRunSkipsExecution() {
+        let dryConfig = StepExecutorConfig(
+            waitForTimeoutSeconds: 2,
+            settlingDelayMs: 0,
+            screenshotDir: NSTemporaryDirectory(),
+            dryRun: true
+        )
+        let dryExecutor = StepExecutor(
+            bridge: bridge, input: input,
+            describer: describer, capture: capture,
+            config: dryConfig
+        )
+
+        // This would fail normally since describer returns nil,
+        // but dry run should pass.
+        describer.describeResult = nil
+        let result = dryExecutor.execute(
+            step: .tap(label: "General"), stepIndex: 0, skillName: "test")
+        XCTAssertEqual(result.status, .passed)
+        XCTAssertEqual(result.message, "dry run")
+    }
+
+    // MARK: - Switch Target
+
+    func testSwitchTargetWithoutRegistryFails() {
+        // The default executor has no registry
+        let result = executor.execute(
+            step: .switchTarget(.ios(app: nil)), stepIndex: 0, skillName: "test")
+        XCTAssertEqual(result.status, .failed)
+        XCTAssertTrue(result.message?.contains("No target registry") ?? false)
+    }
+
+    func testSwitchTargetWithRegistrySuccess() {
+        let bridge2 = StubBridge()
+        bridge2.targetName = "android"
+        let input2 = StubInput()
+        let describer2 = StubDescriber()
+        let capture2 = StubCapture()
+
+        let iphoneCtx = TargetContext(
+            name: "iphone", targetType: "iphone-mirroring", bundleID: nil,
+            bridge: bridge, input: input,
+            capture: capture, describer: describer, recorder: StubRecorder())
+        let androidCtx = TargetContext(
+            name: "android", targetType: "macos-app", bundleID: nil,
+            bridge: bridge2, input: input2,
+            capture: capture2, describer: describer2, recorder: StubRecorder())
+        let registry = TargetRegistry(
+            targets: ["iphone": iphoneCtx, "android": androidCtx],
+            defaultName: "iphone")
+
+        let config = StepExecutorConfig(
+            waitForTimeoutSeconds: 2, settlingDelayMs: 0,
+            screenshotDir: NSTemporaryDirectory() + "test-switch-\(UUID().uuidString)",
+            dryRun: false)
+        let registryExecutor = StepExecutor(
+            bridge: bridge, input: input,
+            describer: describer, capture: capture,
+            config: config, registry: registry)
+
+        let result = registryExecutor.execute(
+            step: .switchTarget(.macos(name: "android")), stepIndex: 0, skillName: "test")
+        XCTAssertEqual(result.status, .passed)
+        XCTAssertTrue(result.message?.contains("android") ?? false)
+    }
+
+    func testSwitchTargetUnknownFails() {
+        let ctx = TargetContext(
+            name: "iphone", targetType: "iphone-mirroring", bundleID: nil,
+            bridge: bridge, input: input,
+            capture: capture, describer: describer, recorder: StubRecorder())
+        let registry = TargetRegistry(targets: ["iphone": ctx], defaultName: "iphone")
+
+        let config = StepExecutorConfig(
+            waitForTimeoutSeconds: 2, settlingDelayMs: 0,
+            screenshotDir: NSTemporaryDirectory() + "test-switch-\(UUID().uuidString)",
+            dryRun: false)
+        let registryExecutor = StepExecutor(
+            bridge: bridge, input: input,
+            describer: describer, capture: capture,
+            config: config, registry: registry)
+
+        let result = registryExecutor.execute(
+            step: .switchTarget(.macos(name: "nonexistent")), stepIndex: 0, skillName: "test")
+        XCTAssertEqual(result.status, .failed)
+        XCTAssertTrue(result.message?.contains("no target named 'nonexistent'") ?? false)
+    }
+}

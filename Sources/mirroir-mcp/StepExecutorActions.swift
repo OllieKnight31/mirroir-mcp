@@ -1,0 +1,274 @@
+/*
+ * Copyright 2026 Async-IO.org
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License"); you may not
+ * use this file except in compliance with the License. You may obtain a copy of
+ * the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ */
+// ABOUTME: Extension with multi-step action implementations for StepExecutor.
+// ABOUTME: Contains scrollTo, resetApp, setNetwork, measure, switchTarget, and screenshot helpers.
+
+import Foundation
+import HelperLib
+
+extension StepExecutor {
+
+    // MARK: - scroll_to
+
+    func executeScrollTo(label: String, direction: ScrollDirection, maxScrolls: Int,
+                          startTime: CFAbsoluteTime) -> StepResult {
+        let step = SkillStep.scrollTo(label: label, direction: direction,
+                                          maxScrolls: maxScrolls)
+
+        let outcome = ScrollSeeker.seek(
+            label: label, toward: direction, maxScrolls: maxScrolls, anchor: nil,
+            band: ScrollSeeker.band(for: profile, orientation: bridge.getOrientation()),
+            bridge: bridge, input: input, describer: describer, call: call)
+        let result = outcome.stepResult
+        return StepResult(step: step, status: result.passed ? .passed : .failed,
+                          message: result.message, durationSeconds: elapsed(startTime))
+    }
+
+    // MARK: - long_press
+
+    func executeLongPress(label: String, durationMs: Int?,
+                           startTime: CFAbsoluteTime) -> StepResult {
+        let step = SkillStep.longPress(label: label, durationMs: durationMs)
+
+        guard let describeResult = describer.describe() else {
+            return StepResult(step: step, status: .failed,
+                              message: captureFailureMessage(),
+                              durationSeconds: elapsed(startTime))
+        }
+
+        guard let match = ElementMatcher.findMatch(label: label, in: describeResult.elements) else {
+            let available = describeResult.elements.map { $0.text }.joined(separator: ", ")
+            return StepResult(step: step, status: .failed,
+                              message: "Element \"\(label)\" not found. Visible: [\(available)]",
+                              durationSeconds: elapsed(startTime))
+        }
+
+        let duration = durationMs ?? EnvConfig.defaultLongPressDurationMs
+        if let error = input.longPress(x: match.element.tapX, y: match.element.tapY,
+                                        durationMs: duration) {
+            return StepResult(step: step, status: .failed, message: error,
+                              durationSeconds: elapsed(startTime))
+        }
+
+        return StepResult(step: step, status: .passed,
+                          message: "long press \(duration)ms via \(match.strategy.rawValue)",
+                          durationSeconds: elapsed(startTime))
+    }
+
+    // MARK: - drag
+
+    func executeDrag(fromLabel: String, toLabel: String,
+                      startTime: CFAbsoluteTime) -> StepResult {
+        let step = SkillStep.drag(fromLabel: fromLabel, toLabel: toLabel)
+
+        guard let describeResult = describer.describe() else {
+            return StepResult(step: step, status: .failed,
+                              message: captureFailureMessage(),
+                              durationSeconds: elapsed(startTime))
+        }
+
+        guard let fromMatch = ElementMatcher.findMatch(label: fromLabel, in: describeResult.elements) else {
+            return StepResult(step: step, status: .failed,
+                              message: "Drag source \"\(fromLabel)\" not found",
+                              durationSeconds: elapsed(startTime))
+        }
+
+        guard let toMatch = ElementMatcher.findMatch(label: toLabel, in: describeResult.elements) else {
+            return StepResult(step: step, status: .failed,
+                              message: "Drag target \"\(toLabel)\" not found",
+                              durationSeconds: elapsed(startTime))
+        }
+
+        if let error = input.drag(fromX: fromMatch.element.tapX, fromY: fromMatch.element.tapY,
+                                   toX: toMatch.element.tapX, toY: toMatch.element.tapY,
+                                   durationMs: EnvConfig.defaultDragDurationMs) {
+            return StepResult(step: step, status: .failed, message: error,
+                              durationSeconds: elapsed(startTime))
+        }
+
+        return StepResult(step: step, status: .passed,
+                          message: "dragged from \"\(fromLabel)\" to \"\(toLabel)\"",
+                          durationSeconds: elapsed(startTime))
+    }
+
+    // MARK: - Operations a target lacks
+
+    /// Why `step` cannot run on the current target, or nil when it can: the
+    /// same refusal the MCP tool gives, so a step is never emulated either.
+    func unsupportedRefusal(of step: SkillStep) -> String? {
+        guard let operation = TargetOperation(step: step) else { return nil }
+        if let registry {
+            return registry.refusal(of: operation, on: profile, named: bridge.targetName)
+        }
+        return profile.refusal(of: operation, targetName: bridge.targetName, supportedOn: [])
+    }
+
+    // MARK: - reset_app
+
+    func executeResetApp(appName: String, startTime: CFAbsoluteTime) -> StepResult {
+        let step = SkillStep.resetApp(appName: appName)
+        guard let menuBridge = self.menuBridge else {
+            return StepResult(step: step, status: .failed,
+                              message: "Target '\(bridge.targetName)' does not support reset_app",
+                              durationSeconds: elapsed(startTime))
+        }
+        if let error = AppSwitcherDismissal.forceQuit(
+            appName: appName,
+            input: input,
+            bridge: bridge,
+            menuBridge: menuBridge,
+            describer: describer
+        ) {
+            return StepResult(step: step, status: .failed, message: error,
+                              durationSeconds: elapsed(startTime))
+        }
+        return StepResult(step: step, status: .passed,
+                          message: "Force-quit \(appName)",
+                          durationSeconds: elapsed(startTime))
+    }
+
+    // MARK: - set_network
+
+    func executeSetNetwork(mode: String, startTime: CFAbsoluteTime) -> StepResult {
+        let step = SkillStep.setNetwork(mode: mode)
+        guard let menuBridge = self.menuBridge else {
+            return StepResult(step: step, status: .failed,
+                              message: "Target '\(bridge.targetName)' does not support set_network",
+                              durationSeconds: elapsed(startTime))
+        }
+
+        switch NetworkToggle.toggle(
+            mode: mode, input: input, describer: ocrDescriber, controlCenterDescriber: describer,
+            menuBridge: menuBridge, settleUs: UInt32(config.settlingDelayMs * 1000)
+        ) {
+        case .success(let message):
+            return StepResult(step: step, status: .passed, message: message,
+                              durationSeconds: elapsed(startTime))
+        case .failure(let error):
+            return StepResult(step: step, status: .failed, message: error.message,
+                              durationSeconds: elapsed(startTime))
+        }
+    }
+
+    // MARK: - measure
+
+    func executeMeasure(name: String, action: SkillStep, until: String,
+                         maxSeconds: Double?, stepIndex: Int,
+                         skillName: String,
+                         startTime: CFAbsoluteTime) -> StepResult {
+        let step = SkillStep.measure(name: name, action: action,
+                                         until: until, maxSeconds: maxSeconds)
+
+        // Execute the nested action
+        let actionResult = execute(step: action, stepIndex: stepIndex,
+                                    skillName: skillName)
+        if actionResult.status.isFailure {
+            return StepResult(step: step, status: .failed,
+                              message: "Action failed: \(actionResult.message ?? "unknown")",
+                              durationSeconds: elapsed(startTime))
+        }
+
+        // Start measuring
+        let measureStart = CFAbsoluteTimeGetCurrent()
+        let timeout = maxSeconds ?? Double(config.waitForTimeoutSeconds)
+        let pollIntervalUs: useconds_t = EnvConfig.measurePollIntervalUs
+
+        let maxPolls = Int(timeout * 2)  // 2 polls per second
+        for _ in 0..<maxPolls {
+            if let describeResult = describer.describe(),
+               ElementMatcher.isVisible(label: until, in: describeResult.elements) {
+                let measuredSeconds = CFAbsoluteTimeGetCurrent() - measureStart
+                if let max = maxSeconds, measuredSeconds > max {
+                    return StepResult(step: step, status: .failed,
+                                      message: "\(name): \(String(format: "%.3f", measuredSeconds))s exceeded \(String(format: "%.1f", max))s max",
+                                      durationSeconds: elapsed(startTime))
+                }
+                return StepResult(step: step, status: .passed,
+                                  message: "\(name): \(String(format: "%.3f", measuredSeconds))s",
+                                  durationSeconds: elapsed(startTime))
+            }
+            usleep(pollIntervalUs)
+        }
+
+        let measuredSeconds = CFAbsoluteTimeGetCurrent() - measureStart
+        return StepResult(step: step, status: .failed,
+                          message: "\(name): timed out after \(String(format: "%.1f", measuredSeconds))s waiting for \"\(until)\"",
+                          durationSeconds: elapsed(startTime))
+    }
+
+    // MARK: - switch_target
+
+    func executeSwitchTarget(selector: TargetSelector, startTime: CFAbsoluteTime) -> StepResult {
+        let step = SkillStep.switchTarget(selector)
+
+        guard let registry = registry else {
+            return StepResult(step: step, status: .failed,
+                              message: "No target registry — cannot switch targets",
+                              durationSeconds: elapsed(startTime))
+        }
+
+        let ctx: TargetContext
+        switch selector.resolve(in: registry) {
+        case .success(let resolved):
+            ctx = resolved
+        case .failure(let error):
+            return StepResult(step: step, status: .failed,
+                              message: error.localizedDescription,
+                              durationSeconds: elapsed(startTime))
+        }
+
+        switchSubsystems(bridge: ctx.bridge, input: ctx.input,
+                         describer: ctx.describer, ocrDescriber: ctx.ocrDescriber,
+                         capture: ctx.capture, profile: ctx.profile)
+
+        return StepResult(step: step, status: .passed,
+                          message: "Switched to target '\(ctx.name)'",
+                          durationSeconds: elapsed(startTime))
+    }
+
+    // MARK: - Screenshot Helpers
+
+    /// Capture and decode a screenshot as raw PNG data.
+    /// Returns nil if capture or base64 decode fails.
+    func captureScreenshotData() -> Data? {
+        guard let base64 = capture.captureBase64(),
+              let data = Data(base64Encoded: base64) else { return nil }
+        return data
+    }
+
+    /// Write PNG data to the screenshot directory, creating it if needed.
+    /// Returns the written file path, or nil on failure.
+    @discardableResult
+    func saveScreenshot(_ data: Data, filename: String) -> String? {
+        let dir = config.screenshotDir
+        try? FileManager.default.createDirectory(
+            atPath: dir, withIntermediateDirectories: true)
+        let path = (dir as NSString).appendingPathComponent(filename)
+        do {
+            try data.write(to: URL(fileURLWithPath: path))
+            return path
+        } catch {
+            return nil
+        }
+    }
+
+    /// Save a screenshot for debugging when a step fails.
+    func captureFailureScreenshot(stepIndex: Int, skillName: String) {
+        guard let data = captureScreenshotData() else { return }
+        let safeName = skillName.replacingOccurrences(of: " ", with: "_")
+        saveScreenshot(data, filename: "\(safeName)_failure_step\(stepIndex + 1).png")
+    }
+}

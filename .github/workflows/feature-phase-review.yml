@@ -1,0 +1,29 @@
+name: "Monitor: Feature Phase Review"
+
+# Weekly caller of the llm-registre review workflow: reads feature-phases.yaml
+# and opens an issue in the private jfarcand/mirroir-carnet register for any
+# dark-launched feature whose review_by date has passed, so a feature that
+# shipped disarmed cannot stay that way unnoticed.
+on:
+  schedule:
+    - cron: "41 9 * * 1"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  review:
+    # Pinned to a commit, not @main: this reusable workflow runs in our context
+    # with a token that can write issues on the private tracker, so upstream
+    # must not be able to change what executes here without review. It is the
+    # same commit the .registre submodule pins, so the two agree. Upstream cuts
+    # no tags, so Dependabot will not bump this — move it by hand alongside the
+    # submodule, after reading the diff of the called workflow.
+    uses: dravr-ai/llm-registre/.github/workflows/feature-phase-review-reusable.yml@7d9c97acb1b6f484a931ce6e838db836fdb0fd0e
+    with:
+      tracker: jfarcand/mirroir-carnet
+      repo_label: iphone-mirroir-mcp
+      title_prefix: mirroir-mcp
+    secrets:
+      tracker_token: ${{ secrets.MIRROIR_CARNET_TOKEN }}

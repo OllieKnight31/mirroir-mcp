@@ -1,0 +1,113 @@
+/*
+ * Copyright 2026 Async-IO.org
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License"); you may not
+ * use this file except in compliance with the License. You may obtain a copy of
+ * the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ */
+// ABOUTME: Tests that an input call launches a stopped iPhone Mirroring in the background and waits out "Connecting".
+// ABOUTME: Pins that a running target is never relaunched, a refused launch keeps the not-running refusal, and Connect is a resume control.
+
+import CoreGraphics
+import XCTest
+@testable import mirroir_mcp
+
+/// Accepts every window event and posts nothing, so taps here never reach
+/// the Mac's event stream.
+private struct SilentWindowPoster: WindowEventPosting {
+    func postButton(down: Bool, at point: CGPoint, clickCount: Int, in window: WindowInfo) -> Bool { true }
+    func focusKeys(in window: WindowInfo) -> Bool { true }
+    func pause(microseconds: UInt32) {}
+    var canStampEvents: Bool { true }
+    func stamp(_ event: CGEvent, at point: CGPoint, in window: WindowInfo) {}
+}
+
+final class LaunchOnInputTests: XCTestCase {
+
+    /// A target that is not a running process on the test Mac, with a window
+    /// poster so a tap that goes through needs no activation.
+    private func makeInput(_ bridge: StubBridge) -> InputSimulation {
+        bridge.processRunning = false
+        bridge.frontmost = false
+        return InputSimulation(bridge: bridge, keyboardLayouts: .usQWERTY,
+                               windowPoster: SilentWindowPoster())
+    }
+
+    func testATapOnAStoppedTargetLaunchesItInTheBackgroundFirst() {
+        let bridge = StubBridge()
+        bridge.state = .notRunning
+        bridge.launchedState = .connected
+
+        XCTAssertNil(makeInput(bridge).tap(x: 100, y: 200, cursorMode: nil))
+        XCTAssertEqual(bridge.launchCount, 1)
+    }
+
+    func testARunningTargetIsNeverLaunched() {
+        let bridge = StubBridge()
+        bridge.launchedState = .connected
+
+        XCTAssertNil(makeInput(bridge).tap(x: 100, y: 200, cursorMode: nil))
+        XCTAssertEqual(bridge.launchCount, 0)
+    }
+
+    func testARefusedLaunchKeepsTheNotRunningRefusal() {
+        let bridge = StubBridge()
+        bridge.state = .notRunning
+
+        let message = makeInput(bridge).tap(x: 100, y: 200, cursorMode: nil)
+
+        XCTAssertEqual(message, "Target 'iphone' is not running. Launch iPhone Mirroring first.")
+        XCTAssertEqual(bridge.launchCount, 1)
+    }
+
+    /// A cold launch reads "Connecting to" for a few seconds: the call waits
+    /// for it rather than refusing while the session comes up.
+    func testTheCallWaitsWhileTheLaunchedSessionConnects() {
+        let bridge = StubBridge()
+        bridge.state = .notRunning
+        bridge.launchedState = .paused
+        bridge.block = SessionBlock(quoted: ["Connecting to iPhone"], move: .waitWhileConnecting)
+        bridge.connectsAt = Date().addingTimeInterval(0.6)
+
+        XCTAssertNil(makeInput(bridge).tap(x: 100, y: 200, cursorMode: nil))
+    }
+
+    /// A block waiting cannot clear ends the wait at once and is quoted.
+    func testABlockThatNeedsTheUserEndsTheWaitAndIsReported() {
+        let bridge = StubBridge()
+        bridge.state = .notRunning
+        bridge.launchedState = .paused
+        bridge.pressResumeResult = false
+        bridge.block = SessionBlock(quoted: ["iPhone in Use"], move: .lockIPhone)
+
+        let started = Date()
+        let message = makeInput(bridge).tap(x: 100, y: 200, cursorMode: nil)
+
+        XCTAssertTrue(message?.contains("“iPhone in Use”") ?? false, message ?? "nil")
+        XCTAssertTrue(message?.contains("lock the iPhone") ?? false, message ?? "nil")
+        XCTAssertLessThan(Date().timeIntervalSince(started), 10, "the launch timeout was not waited out")
+    }
+
+    /// The titles come from iPhone Mirroring's own strings: English always,
+    /// plus the Mac's language. Canadian French says "Connexion" for Connect.
+    func testConnectIsAResumeControlInEnglishAndInTheMacsLanguage() {
+        for title in ["Connect", "Try Again"] {
+            XCTAssertTrue(MirroringWindowResolver.isResumeControl(
+                label: title, phrases: InterstitialFixtures.englishPhrases), title)
+        }
+        for title in ["Connect", "Connexion", "Try Again", "Réessayer", "Reprendre"] {
+            XCTAssertTrue(MirroringWindowResolver.isResumeControl(
+                label: title, phrases: InterstitialFixtures.frenchCanadianPhrases), title)
+        }
+        XCTAssertTrue(InterstitialPhrases.live.isResumeControl(label: "Connect"),
+                      "the live table always holds the English titles")
+    }
+}

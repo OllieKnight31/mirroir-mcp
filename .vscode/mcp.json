@@ -1,0 +1,11 @@
+{
+  "servers": {
+    "mirroir": {
+      "type": "stdio",
+      "command": "${workspaceFolder}/.build/release/mirroir-mcp",
+      "args": [
+        "--yolo"
+      ]
+    }
+  }
+}

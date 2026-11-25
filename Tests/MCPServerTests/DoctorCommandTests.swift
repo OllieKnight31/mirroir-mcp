@@ -1,0 +1,269 @@
+/*
+ * Copyright 2026 Async-IO.org
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License"); you may not
+ * use this file except in compliance with the License. You may obtain a copy of
+ * the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ */
+// ABOUTME: Tests for DoctorCommand argument parsing, output formatting, and JSON parsing.
+// ABOUTME: Validates the diagnostic command's pure-logic methods without requiring system state.
+
+import XCTest
+@testable import mirroir_mcp
+
+final class DoctorCommandTests: XCTestCase {
+
+    // MARK: - Argument Parsing
+
+    func testParseArgumentsDefault() throws {
+        let config = try DoctorCommand.parseArguments([])
+        XCTAssertFalse(config.noColor)
+        XCTAssertFalse(config.json)
+    }
+
+    func testParseArgumentsNoColor() throws {
+        let config = try DoctorCommand.parseArguments(["--no-color"])
+        XCTAssertTrue(config.noColor)
+    }
+
+    func testParseArgumentsJSON() throws {
+        let config = try DoctorCommand.parseArguments(["--json"])
+        XCTAssertTrue(config.json)
+    }
+
+    func testParseArgumentsCombined() throws {
+        let config = try DoctorCommand.parseArguments(["--no-color", "--json"])
+        XCTAssertTrue(config.noColor)
+        XCTAssertTrue(config.json)
+    }
+
+    func testParseArgumentsRefusesWhatDoctorDoesNotTake() {
+        XCTAssertThrowsError(try DoctorCommand.parseArguments(["--jsno"])) {
+            XCTAssertEqual($0 as? CLIArgumentError, .unknownOption("--jsno", command: "doctor"))
+        }
+        XCTAssertThrowsError(try DoctorCommand.parseArguments(["extra"])) {
+            XCTAssertEqual($0 as? CLIArgumentError, .unexpectedArgument("extra", command: "doctor"))
+        }
+    }
+
+    // MARK: - formatCheck Output
+
+    func testFormatCheckPassed() {
+        let check = DoctorCheck(
+            name: "macOS version",
+            status: .passed,
+            detail: "macOS 15.2.0 (Sequoia)",
+            fixHint: nil
+        )
+        let output = DoctorCommand.formatCheck(check, useColor: false)
+        XCTAssertTrue(output.contains("✓"))
+        XCTAssertTrue(output.contains("macOS 15.2.0 (Sequoia)"))
+        XCTAssertFalse(output.contains("→"))
+    }
+
+    func testFormatCheckFailed() {
+        let check = DoctorCheck(
+            name: "Accessibility",
+            status: .failed,
+            detail: "not granted",
+            fixHint: "Open System Settings > Privacy & Security > Accessibility"
+        )
+        let output = DoctorCommand.formatCheck(check, useColor: false)
+        XCTAssertTrue(output.contains("✗"))
+        XCTAssertTrue(output.contains("not granted"))
+        XCTAssertTrue(output.contains("→"))
+        XCTAssertTrue(output.contains("System Settings"))
+    }
+
+    func testFormatCheckWarned() {
+        let check = DoctorCheck(
+            name: "Screen recording",
+            status: .warned,
+            detail: "not configured",
+            fixHint: "Grant screen recording permission"
+        )
+        let output = DoctorCommand.formatCheck(check, useColor: false)
+        XCTAssertTrue(output.contains("!"))
+        XCTAssertTrue(output.contains("not configured"))
+        XCTAssertTrue(output.contains("→"))
+    }
+
+    func testFormatCheckNoColorNoANSI() {
+        let check = DoctorCheck(
+            name: "test",
+            status: .passed,
+            detail: "ok",
+            fixHint: nil
+        )
+        let output = DoctorCommand.formatCheck(check, useColor: false)
+        XCTAssertFalse(output.contains("\u{001B}"))
+    }
+
+    func testFormatCheckWithColorContainsANSI() {
+        let check = DoctorCheck(
+            name: "test",
+            status: .passed,
+            detail: "ok",
+            fixHint: nil
+        )
+        let output = DoctorCommand.formatCheck(check, useColor: true)
+        XCTAssertTrue(output.contains("\u{001B}[32m"))  // green
+        XCTAssertTrue(output.contains("\u{001B}[0m"))    // reset
+    }
+
+    func testFormatCheckFailedColorContainsRed() {
+        let check = DoctorCheck(
+            name: "test",
+            status: .failed,
+            detail: "bad",
+            fixHint: "fix it"
+        )
+        let output = DoctorCommand.formatCheck(check, useColor: true)
+        XCTAssertTrue(output.contains("\u{001B}[31m"))  // red
+    }
+
+    // MARK: - Summary Formatting
+
+    func testFormatSummaryAllPassed() {
+        let checks = (0..<10).map { i in
+            DoctorCheck(name: "check\(i)", status: .passed, detail: "ok", fixHint: nil)
+        }
+        let summary = DoctorCommand.formatSummary(checks: checks, useColor: false)
+        XCTAssertTrue(summary.contains("10 passed"))
+        XCTAssertFalse(summary.contains("failed"))
+        XCTAssertFalse(summary.contains("warned"))
+    }
+
+    func testFormatSummaryMixed() {
+        let checks = [
+            DoctorCheck(name: "a", status: .passed, detail: "ok", fixHint: nil),
+            DoctorCheck(name: "b", status: .passed, detail: "ok", fixHint: nil),
+            DoctorCheck(name: "c", status: .failed, detail: "bad", fixHint: "fix"),
+            DoctorCheck(name: "d", status: .warned, detail: "maybe", fixHint: "check"),
+        ]
+        let summary = DoctorCommand.formatSummary(checks: checks, useColor: false)
+        XCTAssertTrue(summary.contains("2 passed"))
+        XCTAssertTrue(summary.contains("1 failed"))
+        XCTAssertTrue(summary.contains("1 warned"))
+    }
+
+    func testFormatSummaryNoColor() {
+        let checks = [
+            DoctorCheck(name: "a", status: .passed, detail: "ok", fixHint: nil),
+        ]
+        let summary = DoctorCommand.formatSummary(checks: checks, useColor: false)
+        XCTAssertFalse(summary.contains("\u{001B}"))
+    }
+
+    // MARK: - macOS Codename
+
+    func testMacOSCodename() {
+        XCTAssertEqual(DoctorCommand.macOSCodename(major: 15), "Sequoia")
+        XCTAssertEqual(DoctorCommand.macOSCodename(major: 16), "Tahoe")
+        XCTAssertEqual(DoctorCommand.macOSCodename(major: 17), "macOS 17")
+    }
+
+    // MARK: - Status Symbols
+
+    func testStatusSymbolsPassed() {
+        let (icon, color, reset) = DoctorCommand.statusSymbols(.passed, useColor: true)
+        XCTAssertEqual(icon, "✓")
+        XCTAssertEqual(color, "\u{001B}[32m")
+        XCTAssertEqual(reset, "\u{001B}[0m")
+    }
+
+    func testStatusSymbolsFailed() {
+        let (icon, color, reset) = DoctorCommand.statusSymbols(.failed, useColor: true)
+        XCTAssertEqual(icon, "✗")
+        XCTAssertEqual(color, "\u{001B}[31m")
+        XCTAssertEqual(reset, "\u{001B}[0m")
+    }
+
+    func testStatusSymbolsWarned() {
+        let (icon, color, reset) = DoctorCommand.statusSymbols(.warned, useColor: true)
+        XCTAssertEqual(icon, "!")
+        XCTAssertEqual(color, "\u{001B}[33m")
+        XCTAssertEqual(reset, "\u{001B}[0m")
+    }
+
+    func testStatusSymbolsNoColor() {
+        let (icon, color, reset) = DoctorCommand.statusSymbols(.passed, useColor: false)
+        XCTAssertEqual(icon, "✓")
+        XCTAssertEqual(color, "")
+        XCTAssertEqual(reset, "")
+    }
+
+    // MARK: - Prompt Override Check
+
+    func testPromptOverrideCheckPassesWhenNoOverrideExists() throws {
+        let (local, global) = try makePromptDirs()
+        let checks = PromptOverrideCheck.run(searchDirs: [local, global])
+        XCTAssertEqual(checks.count, 1)
+        XCTAssertEqual(checks.first?.status, .passed)
+    }
+
+    func testPromptOverrideCheckWarnsWithPathOfEachActiveOverride() throws {
+        let (local, global) = try makePromptDirs()
+        let diagnosis = global + "/" + SystemPromptFile.diagnosis.rawValue
+        let vision = local + "/" + SystemPromptFile.screenDescribe.rawValue
+        try "stale diagnosis prompt".write(toFile: diagnosis, atomically: true, encoding: .utf8)
+        try "custom vision prompt".write(toFile: vision, atomically: true, encoding: .utf8)
+
+        let checks = PromptOverrideCheck.run(searchDirs: [local, global])
+
+        XCTAssertEqual(checks.count, 2)
+        XCTAssertTrue(checks.allSatisfy { $0.status == .warned && $0.fixHint != nil })
+        XCTAssertTrue(checks.contains { $0.detail.contains(diagnosis) })
+        XCTAssertTrue(checks.contains { $0.detail.contains(vision) })
+        // Each hint names the file it reports, not a fixed one.
+        for file in SystemPromptFile.allCases {
+            let check = checks.first { $0.detail.hasSuffix("/" + file.rawValue) }
+            XCTAssertTrue(check?.fixHint?.contains("copied \(file.rawValue) there") ?? false,
+                          "hint for \(file.rawValue) does not name it")
+        }
+    }
+
+    func testPromptOverrideCheckReportsOnlyTheFileThatWins() throws {
+        let (local, global) = try makePromptDirs()
+        let localDiagnosis = local + "/" + SystemPromptFile.diagnosis.rawValue
+        try "local prompt".write(toFile: localDiagnosis, atomically: true, encoding: .utf8)
+        try "global prompt".write(
+            toFile: global + "/" + SystemPromptFile.diagnosis.rawValue, atomically: true, encoding: .utf8)
+
+        let checks = PromptOverrideCheck.run(searchDirs: [local, global])
+
+        XCTAssertEqual(checks.count, 1)
+        XCTAssertEqual(checks.first?.detail, "override active: \(localDiagnosis)")
+    }
+
+    func testPromptOverrideCheckIgnoresWhitespaceOnlyFile() throws {
+        let (local, global) = try makePromptDirs()
+        try "  \n\t\n".write(
+            toFile: global + "/" + SystemPromptFile.diagnosis.rawValue, atomically: true, encoding: .utf8)
+
+        let checks = PromptOverrideCheck.run(searchDirs: [local, global])
+
+        XCTAssertEqual(checks.count, 1)
+        XCTAssertEqual(checks.first?.status, .passed)
+    }
+
+    /// Creates a local and a global prompt directory under a temp root removed after the test.
+    private func makePromptDirs() throws -> (local: String, global: String) {
+        let root = NSTemporaryDirectory() + "doctor-prompt-test-\(UUID().uuidString)"
+        let local = root + "/local"
+        let global = root + "/global"
+        for dir in [local, global] {
+            try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        }
+        addTeardownBlock { try? FileManager.default.removeItem(atPath: root) }
+        return (local, global)
+    }
+}

@@ -1,0 +1,12 @@
+version: 1
+name: web — role= and text= locator engines (chromium)
+steps:
+  - spawn: { id: session, from: SAMPLE.md }
+  # chromium only: the locator-engine passthrough is a Playwright-level concern,
+  # not browser-specific, so one browser proves it. The server's cwd (and thus
+  # the listed entries) varies by runner, so assert only the cwd-independent
+  # parts of the python directory listing: the heading (role=) and its text
+  # (text= substring engine).
+  - target: { kind: web, browsers: [chrome], url: "http://127.0.0.1:18898/" }
+  - assert_visible: "role=heading[name=\"Directory listing for /\"]"
+  - assert_visible: "text=Directory listing"

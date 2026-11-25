@@ -1,0 +1,47 @@
+# Dependabot version updates.
+# https://docs.github.com/code-security/dependabot/dependabot-version-updates/configuration-options-for-the-dependabot.yml-file
+#
+# One entry per manifest location. The previous config declared an empty
+# package-ecosystem at the repo root, which matches no ecosystem, so no update
+# PRs were ever opened and the runner and website lockfiles drifted behind
+# their advisories.
+#
+# cooldown holds a PR until a release has been public for a week, which
+# narrows the window in which a compromised release gets merged automatically.
+
+version: 2
+updates:
+  - package-ecosystem: "cargo"
+    directory: "/runner"
+    schedule:
+      interval: "weekly"
+    cooldown:
+      default-days: 7
+
+  - package-ecosystem: "npm"
+    directory: "/website"
+    schedule:
+      interval: "weekly"
+    cooldown:
+      default-days: 7
+
+  - package-ecosystem: "npm"
+    directory: "/npm"
+    schedule:
+      interval: "weekly"
+    cooldown:
+      default-days: 7
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    cooldown:
+      default-days: 7
+
+  - package-ecosystem: "swift"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    cooldown:
+      default-days: 7

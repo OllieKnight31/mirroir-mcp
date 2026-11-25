@@ -1,0 +1,492 @@
+/*
+ * Copyright 2026 Async-IO.org
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License"); you may not
+ * use this file except in compliance with the License. You may obtain a copy of
+ * the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ */
+// ABOUTME: Registers input-related MCP tools: swipe, drag, type_text, press_key, long_press, double_tap, shake (tap is in TapTools).
+// ABOUTME: Each tool maps MCP JSON-RPC calls to the InputSimulation subsystem via CGEvent.
+
+import Foundation
+import HelperLib
+
+extension MirroirMCP {
+    /// Schema fragment for the optional cursor_mode parameter on coordinate tools.
+    static let cursorModeSchema: JSONValue = .object([
+        "type": .string("string"),
+        "enum": .array([.string("direct"), .string("preserving")]),
+        "description": .string(
+            "Cursor management: 'direct' leaves cursor at target, "
+            + "'preserving' restores cursor to its original position after the operation. "
+            + "Defaults to 'direct' for iPhone Mirroring, 'preserving' for generic windows."),
+    ])
+
+    /// Result of parsing cursor_mode: a valid mode (or nil for default) vs an error message.
+    enum CursorModeResult {
+        case ok(CursorMode?)
+        case invalid(String)
+    }
+
+    /// Parse an optional cursor_mode string from tool args into a CursorMode.
+    /// Returns `.ok(nil)` when absent, `.ok(mode)` for valid values,
+    /// or `.invalid(message)` for unrecognized values.
+    static func parseCursorMode(_ args: [String: JSONValue]) -> CursorModeResult {
+        guard let value = args["cursor_mode"]?.asString() else { return .ok(nil) }
+        switch value {
+        case "direct": return .ok(.direct)
+        case "preserving": return .ok(.preserving)
+        default:
+            return .invalid("Invalid cursor_mode '\(value)'. Must be 'direct' or 'preserving'.")
+        }
+    }
+
+    static func registerInputTools(
+        server: MCPServer,
+        registry: TargetRegistry,
+        policy: PermissionPolicy
+    ) {
+        // swipe — drag gesture on the mirrored iPhone
+        server.registerTool(MCPToolDefinition(
+            name: "swipe",
+            description: """
+                Perform a swipe gesture on the mirrored iPhone screen. \
+                Coordinates are relative to the iPhone Mirroring window. \
+                Content follows the finger: swipe up (scroll down), swipe down \
+                (scroll up), swipe left to reveal content on the right. \
+                Paging surfaces like video feeds snap to the next page only on a \
+                real flick, 2000 points per second or faster: for example 75% of \
+                the screen height in 150 ms. Anything slower is a drag that moves \
+                the content exactly as far as the finger, with no inertia: it runs \
+                at most 140 points per second, so the default 300 ms over a third \
+                of the screen takes about 2 s.
+                """,
+            inputSchema: [
+                "type": .string("object"),
+                "properties": .object([
+                    "from_x": .object([
+                        "type": .string("number"),
+                        "description": .string("Start X coordinate"),
+                    ]),
+                    "from_y": .object([
+                        "type": .string("number"),
+                        "description": .string("Start Y coordinate"),
+                    ]),
+                    "to_x": .object([
+                        "type": .string("number"),
+                        "description": .string("End X coordinate"),
+                    ]),
+                    "to_y": .object([
+                        "type": .string("number"),
+                        "description": .string("End Y coordinate"),
+                    ]),
+                    "duration_ms": .object([
+                        "type": .string("number"),
+                        "description": .string(
+                            "Duration of swipe in milliseconds (default: 300); a drag below flick speed is slowed to at most 140 points per second"),
+                    ]),
+                    "cursor_mode": cursorModeSchema,
+                ]),
+                "required": .array([
+                    .string("from_x"), .string("from_y"),
+                    .string("to_x"), .string("to_y"),
+                ]),
+            ],
+            handler: { args in
+                let (ctx, err) = registry.resolveForTool(args)
+                guard let ctx else { return err! }
+                let input = ctx.input
+
+                guard let fromX = args["from_x"]?.asNumber(),
+                    let fromY = args["from_y"]?.asNumber(),
+                    let toX = args["to_x"]?.asNumber(),
+                    let toY = args["to_y"]?.asNumber()
+                else {
+                    return .error(
+                        "Missing required parameters: from_x, from_y, to_x, to_y (numbers)")
+                }
+
+                let duration = args["duration_ms"]?.asInt() ?? EnvConfig.defaultSwipeDurationMs
+
+                let cursorMode: CursorMode?
+                switch parseCursorMode(args) {
+                case .ok(let mode): cursorMode = mode
+                case .invalid(let msg): return .error(msg)
+                }
+
+                if let error = input.swipe(
+                    fromX: fromX, fromY: fromY,
+                    toX: toX, toY: toY,
+                    durationMs: duration,
+                    cursorMode: cursorMode
+                ) {
+                    return .error(error)
+                }
+                return .text(
+                    "Swiped from (\(Int(fromX)),\(Int(fromY))) to (\(Int(toX)),\(Int(toY)))"
+                )
+            }
+        ))
+
+        // drag — slow deliberate drag from point A to point B
+        server.registerTool(MCPToolDefinition(
+            name: "drag",
+            description: """
+                Drag from one point to another on the mirrored iPhone screen \
+                with sustained contact. Unlike swipe (quick flick), drag is a \
+                slow deliberate movement for rearranging icons, adjusting sliders, \
+                and drag-and-drop operations. Coordinates are relative to the \
+                iPhone Mirroring window.
+                """,
+            inputSchema: [
+                "type": .string("object"),
+                "properties": .object([
+                    "from_x": .object([
+                        "type": .string("number"),
+                        "description": .string("Start X coordinate"),
+                    ]),
+                    "from_y": .object([
+                        "type": .string("number"),
+                        "description": .string("Start Y coordinate"),
+                    ]),
+                    "to_x": .object([
+                        "type": .string("number"),
+                        "description": .string("End X coordinate"),
+                    ]),
+                    "to_y": .object([
+                        "type": .string("number"),
+                        "description": .string("End Y coordinate"),
+                    ]),
+                    "duration_ms": .object([
+                        "type": .string("number"),
+                        "description": .string(
+                            "Duration of drag in milliseconds (default: 1000, minimum: 200)"),
+                    ]),
+                    "cursor_mode": cursorModeSchema,
+                ]),
+                "required": .array([
+                    .string("from_x"), .string("from_y"),
+                    .string("to_x"), .string("to_y"),
+                ]),
+            ],
+            handler: { args in
+                let (ctx, err) = registry.resolveForTool(args)
+                guard let ctx else { return err! }
+                let input = ctx.input
+
+                guard let fromX = args["from_x"]?.asNumber(),
+                    let fromY = args["from_y"]?.asNumber(),
+                    let toX = args["to_x"]?.asNumber(),
+                    let toY = args["to_y"]?.asNumber()
+                else {
+                    return .error(
+                        "Missing required parameters: from_x, from_y, to_x, to_y (numbers)")
+                }
+
+                let duration = args["duration_ms"]?.asInt() ?? EnvConfig.defaultDragDurationMs
+
+                let cursorMode: CursorMode?
+                switch parseCursorMode(args) {
+                case .ok(let mode): cursorMode = mode
+                case .invalid(let msg): return .error(msg)
+                }
+
+                if let error = input.drag(
+                    fromX: fromX, fromY: fromY,
+                    toX: toX, toY: toY,
+                    durationMs: duration,
+                    cursorMode: cursorMode
+                ) {
+                    return .error(error)
+                }
+                return .text(
+                    "Dragged from (\(Int(fromX)),\(Int(fromY))) to (\(Int(toX)),\(Int(toY))) over \(duration)ms"
+                )
+            }
+        ))
+
+        // type_text — type text via CGEvent key events with layout translation
+        server.registerTool(MCPToolDefinition(
+            name: "type_text",
+            description: """
+                Type text on the mirrored iPhone. On iPhone Mirroring through macOS 26 \
+                the keys go to its window without bringing it to the front; on a later \
+                macOS, and on other targets, the window is activated first. \
+                A text field must be active on the iPhone. \
+                Sends keystrokes through the CGEvent keyboard interface \
+                with automatic keyboard layout translation for non-US layouts. \
+                Characters with no key on the iPhone's layout (emoji, CJK, \
+                symbols the layout lacks) are pasted one run at a time through \
+                Universal Clipboard, and each paste is confirmed by OCR before \
+                the next. A paste not seen on screen fails the call and names \
+                what was not confirmed. Emoji and pictographic symbols cannot \
+                be read back by OCR, so text containing them always returns an \
+                error even when the paste landed — check the screen. Non-Latin \
+                scripts are confirmed only when OCR reads their language (the \
+                Mac's preferred languages, or ocrLanguages when set). \
+                Typed text is read back from the screen: when iOS autocorrect \
+                rewrote it, the call still succeeds and the result says the \
+                screen does not show what was typed. When keyboardLayout lists \
+                several layouts (iPhones with different keyboards on one Mac), \
+                characters they type with different keys are pasted, and the \
+                result says so, until keyboard_layout gives the connected \
+                phone's layout. Typing adds to what the \
+                field already holds; pass clear=true to empty a pre-filled \
+                field first (Cmd+A, then Delete). Clear only a text field you \
+                just focused: with no field focused, Cmd+A acts on whatever \
+                the app selects.
+                """,
+            inputSchema: [
+                "type": .string("object"),
+                "properties": .object([
+                    "text": .object([
+                        "type": .string("string"),
+                        "description": .string("The text to type"),
+                    ]),
+                    "clear": .object([
+                        "type": .string("boolean"),
+                        "description": .string(
+                            "Empty the focused field first (Cmd+A, then Delete). Default false."),
+                    ]),
+                    "keyboard_layout": .object([
+                        "type": .string("string"),
+                        "description": .string(
+                            "The connected iPhone's hardware keyboard layout, one of the "
+                            + "keyboardLayout names in settings. Give it when a result says "
+                            + "characters were pasted because the layouts disagree; it is "
+                            + "remembered for this phone."),
+                    ]),
+                ]),
+                "required": .array([.string("text")]),
+            ],
+            handler: { args in
+                let (ctx, err) = registry.resolveForTool(args)
+                guard let ctx else { return err! }
+                let input = ctx.input
+
+                guard let text = args["text"]?.asString() else {
+                    return .error("Missing required parameter: text (string)")
+                }
+
+                let clear = args["clear"]?.asBool() ?? false
+                if let layout = args["keyboard_layout"]?.asString(),
+                   let refusal = input.rememberKeyboardLayout(layout) {
+                    return .error(refusal)
+                }
+
+                let result = FieldClearing.type(text, clearFirst: clear, using: input)
+                guard result.success else {
+                    return .error(result.error ?? "Failed to type text")
+                }
+                let typed = clear
+                    ? "Cleared the field, then typed \(text.count) characters"
+                    : "Typed \(text.count) characters"
+                return .text(result.notice.map { "\(typed)\n\n\($0)" } ?? typed)
+            }
+        ))
+
+        // press_key — send a special key press with optional modifiers
+        server.registerTool(MCPToolDefinition(
+            name: "press_key",
+            description: """
+                Send a key press to the mirrored iPhone with optional modifiers. \
+                On iPhone Mirroring through macOS 26 the key goes to its window without \
+                bringing it to the front; on a later macOS, and on other targets, the window \
+                is activated first. \
+                Supported keys: return, escape, tab, delete, space, up, down, left, right, \
+                or any single character (a-z, 0-9, etc.) for shortcuts. \
+                Optional modifiers: command, shift, option, control. \
+                Examples: press Return to confirm, Escape to cancel, Ctrl+Cmd+Z for shake.
+                """,
+            inputSchema: [
+                "type": .string("object"),
+                "properties": .object([
+                    "key": .object([
+                        "type": .string("string"),
+                        "description": .string(
+                            "Key name: return, escape, tab, delete, space, up, down, left, right, or a single character"),
+                    ]),
+                    "modifiers": .object([
+                        "type": .string("array"),
+                        "items": .object([
+                            "type": .string("string"),
+                        ]),
+                        "description": .string(
+                            "Optional modifier keys: command, shift, option, control"),
+                    ]),
+                ]),
+                "required": .array([.string("key")]),
+            ],
+            handler: { args in
+                let (ctx, err) = registry.resolveForTool(args)
+                guard let ctx else { return err! }
+                let input = ctx.input
+
+                guard let keyName = args["key"]?.asString() else {
+                    return .error("Missing required parameter: key (string)")
+                }
+
+                let modifiers = args["modifiers"]?.asStringArray() ?? []
+
+                let result = input.pressKey(
+                    keyName: keyName, modifiers: modifiers
+                )
+                guard result.success else {
+                    return .error(result.error ?? "Failed to press key")
+                }
+
+                if modifiers.isEmpty {
+                    return .text("Pressed \(keyName)")
+                }
+                return .text("Pressed \(modifiers.joined(separator: "+"))+\(keyName)")
+            }
+        ))
+
+        // long_press — hold tap at coordinates for a configurable duration
+        server.registerTool(MCPToolDefinition(
+            name: "long_press",
+            description: """
+                Long press at a specific position on the mirrored iPhone screen. \
+                Holds the tap for a configurable duration (default 500ms). \
+                Use for context menus, drag initiation, and any gesture that \
+                requires holding a touch. Coordinates are relative to the \
+                iPhone Mirroring window.
+                """,
+            inputSchema: [
+                "type": .string("object"),
+                "properties": .object([
+                    "x": .object([
+                        "type": .string("number"),
+                        "description": .string(
+                            "X coordinate relative to the mirroring window (0 = left edge)"),
+                    ]),
+                    "y": .object([
+                        "type": .string("number"),
+                        "description": .string(
+                            "Y coordinate relative to the mirroring window (0 = top edge)"),
+                    ]),
+                    "duration_ms": .object([
+                        "type": .string("number"),
+                        "description": .string(
+                            "Hold duration in milliseconds (default: 500, minimum: 100)"),
+                    ]),
+                    "cursor_mode": cursorModeSchema,
+                ]),
+                "required": .array([.string("x"), .string("y")]),
+            ],
+            handler: { args in
+                let (ctx, err) = registry.resolveForTool(args)
+                guard let ctx else { return err! }
+                let input = ctx.input
+
+                guard let x = args["x"]?.asNumber(), let y = args["y"]?.asNumber() else {
+                    return .error("Missing required parameters: x, y (numbers)")
+                }
+
+                let duration = args["duration_ms"]?.asInt() ?? EnvConfig.defaultLongPressDurationMs
+
+                let cursorMode: CursorMode?
+                switch parseCursorMode(args) {
+                case .ok(let mode): cursorMode = mode
+                case .invalid(let msg): return .error(msg)
+                }
+
+                if let refusal = BlockedAppTapGuard.refusal(
+                    at: CGPoint(x: x, y: y), ctx: ctx, policy: policy) {
+                    return .error(refusal)
+                }
+                if let error = input.longPress(x: x, y: y, durationMs: duration,
+                                               cursorMode: cursorMode) {
+                    return .error(error)
+                }
+                return .text("Long pressed at (\(Int(x)), \(Int(y))) for \(duration)ms")
+            }
+        ))
+
+        // double_tap — two rapid taps at coordinates
+        server.registerTool(MCPToolDefinition(
+            name: "double_tap",
+            description: """
+                Double-tap at a specific position on the mirrored iPhone screen. \
+                Performs two rapid taps for gestures like zoom, text selection, \
+                and widget activation. Coordinates are relative to the \
+                iPhone Mirroring window.
+                """,
+            inputSchema: [
+                "type": .string("object"),
+                "properties": .object([
+                    "x": .object([
+                        "type": .string("number"),
+                        "description": .string(
+                            "X coordinate relative to the mirroring window (0 = left edge)"),
+                    ]),
+                    "y": .object([
+                        "type": .string("number"),
+                        "description": .string(
+                            "Y coordinate relative to the mirroring window (0 = top edge)"),
+                    ]),
+                    "cursor_mode": cursorModeSchema,
+                ]),
+                "required": .array([.string("x"), .string("y")]),
+            ],
+            handler: { args in
+                let (ctx, err) = registry.resolveForTool(args)
+                guard let ctx else { return err! }
+                let input = ctx.input
+
+                guard let x = args["x"]?.asNumber(), let y = args["y"]?.asNumber() else {
+                    return .error("Missing required parameters: x, y (numbers)")
+                }
+
+                let cursorMode: CursorMode?
+                switch parseCursorMode(args) {
+                case .ok(let mode): cursorMode = mode
+                case .invalid(let msg): return .error(msg)
+                }
+
+                if let refusal = BlockedAppTapGuard.refusal(
+                    at: CGPoint(x: x, y: y), ctx: ctx, policy: policy) {
+                    return .error(refusal)
+                }
+                if let error = input.doubleTap(x: x, y: y, cursorMode: cursorMode) {
+                    return .error(error)
+                }
+                return .text("Double-tapped at (\(Int(x)), \(Int(y)))")
+            }
+        ))
+
+        // shake — trigger a device shake gesture
+        server.registerTool(MCPToolDefinition(
+            name: "shake",
+            description: """
+                Trigger a shake gesture on the mirrored iPhone. \
+                Sends Ctrl+Cmd+Z which triggers shake-to-undo in iOS apps. \
+                Useful for: Expo Go developer menu, React Native debug menu, \
+                undo actions, and any app that responds to device shake.
+                """,
+            inputSchema: [
+                "type": .string("object"),
+                "properties": .object([:]),
+            ],
+            handler: { args in
+                let (ctx, err) = registry.resolveForTool(args, requiring: .shake)
+                guard let ctx else { return err! }
+                let input = ctx.input
+
+                let result = input.shake()
+                guard result.success else {
+                    return .error(result.error ?? "Failed to trigger shake")
+                }
+                return .text("Triggered shake gesture (Ctrl+Cmd+Z)")
+            }
+        ))
+    }
+}

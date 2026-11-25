@@ -1,0 +1,376 @@
+/*
+ * Copyright 2026 Async-IO.org
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License"); you may not
+ * use this file except in compliance with the License. You may obtain a copy of
+ * the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ */
+// ABOUTME: Diagnoses compiled skill failures by running one OCR call on the actual screen.
+// ABOUTME: Compares compiled hints against reality and produces actionable patch recommendations.
+
+import Foundation
+import HelperLib
+
+/// Diagnoses why a compiled step failed by comparing cached hints against the actual screen.
+/// Costs exactly one OCR call per failure — zero cost on success.
+enum AgentDiagnostic {
+
+    /// A recommendation for fixing a compiled step.
+    struct Recommendation {
+        let stepIndex: Int
+        let stepType: String
+        let label: String?
+        let diagnosis: String
+        let patches: [Patch]
+        /// Base64-encoded screenshot of the screen at the time of diagnosis.
+        let screenshotBase64: String?
+    }
+
+    /// A single field change in the compiled JSON.
+    struct Patch {
+        let field: String
+        let was: String
+        let shouldBe: String
+    }
+
+    /// Diagnose a compiled step failure by OCR-ing the current screen.
+    /// Returns a recommendation with specific patches, or nil if diagnosis isn't possible.
+    static func diagnose(
+        step: SkillStep,
+        compiledStep: CompiledStep,
+        failureMessage: String?,
+        describer: ScreenDescribing
+    ) -> Recommendation? {
+        guard let hints = compiledStep.hints else { return nil }
+        // A compiled label is the step's replay value (e.g. `"General" timeout: 30`).
+        // The screen is matched against the element text of the step that ran, whose
+        // `${VAR}` values are resolved; the report and the AI payload show the text
+        // parsed from the stored label instead, with placeholders, so a secret stays out.
+        let matchLabel = step.labelValue ?? ""
+        let compiledStep = CompiledStep(
+            index: compiledStep.index, type: compiledStep.type,
+            label: compiledStep.label.map { label in
+                SkillParser.parseStep(key: compiledStep.type, rawValue: label).labelValue ?? label
+            },
+            hints: hints)
+
+        // Run one OCR call to see the actual screen
+        guard let screen = describer.describe() else {
+            return Recommendation(
+                stepIndex: compiledStep.index,
+                stepType: compiledStep.type,
+                label: compiledStep.label,
+                diagnosis: "Cannot OCR screen for diagnosis (capture failed)",
+                patches: [],
+                screenshotBase64: nil
+            )
+        }
+
+        let screenshot = screen.screenshotBase64
+
+        switch hints.compiledAction {
+        case .tap:
+            return diagnoseTap(compiledStep: compiledStep, matchLabel: matchLabel, hints: hints,
+                               screen: screen, failureMessage: failureMessage,
+                               screenshot: screenshot)
+        case .assertion:
+            return diagnoseAssertion(compiledStep: compiledStep, matchLabel: matchLabel, hints: hints,
+                                 screen: screen, failureMessage: failureMessage,
+                                 screenshot: screenshot)
+        case .scrollSequence:
+            return diagnoseScroll(compiledStep: compiledStep, matchLabel: matchLabel, hints: hints,
+                                  screen: screen, failureMessage: failureMessage,
+                                  screenshot: screenshot)
+        case .passthrough:
+            return diagnosePassthrough(compiledStep: compiledStep,
+                                       screen: screen, failureMessage: failureMessage,
+                                       screenshot: screenshot)
+        }
+    }
+
+    // MARK: - Tap Diagnosis
+
+    private static func diagnoseTap(
+        compiledStep: CompiledStep,
+        matchLabel: String,
+        hints: StepHints,
+        screen: ScreenDescriber.DescribeResult,
+        failureMessage: String?,
+        screenshot: String
+    ) -> Recommendation {
+        let label = compiledStep.label ?? ""
+        let compiledX = hints.tapX ?? 0
+        let compiledY = hints.tapY ?? 0
+
+        // Check if the target element is still on screen but at different coordinates
+        if let match = ElementMatcher.findMatch(label: matchLabel, in: screen.elements,
+                                               nearestTo: (compiledX, compiledY)) {
+            let dx = abs(match.element.tapX - compiledX)
+            let dy = abs(match.element.tapY - compiledY)
+
+            let tolerance = EnvConfig.compiledTapPositionTolerance
+            if dx <= tolerance && dy <= tolerance {
+                return Recommendation(
+                    stepIndex: compiledStep.index,
+                    stepType: compiledStep.type,
+                    label: label,
+                    diagnosis: "Element \"\(label)\" is at the compiled position — tap may have been absorbed by the UI",
+                    patches: [],
+                    screenshotBase64: screenshot
+                )
+            }
+
+            return Recommendation(
+                stepIndex: compiledStep.index,
+                stepType: compiledStep.type,
+                label: label,
+                diagnosis: "Element \"\(label)\" moved: compiled (\(fmt(compiledX)), \(fmt(compiledY))) vs actual (\(fmt(match.element.tapX)), \(fmt(match.element.tapY)))",
+                patches: [
+                    Patch(field: "tapX", was: fmt(compiledX), shouldBe: fmt(match.element.tapX)),
+                    Patch(field: "tapY", was: fmt(compiledY), shouldBe: fmt(match.element.tapY)),
+                ],
+                screenshotBase64: screenshot
+            )
+        }
+
+        // Element not found — list what IS on screen
+        let visible = screen.elements.prefix(10).map { "\"\($0.text)\" (\(fmt($0.tapX)), \(fmt($0.tapY)))" }
+        return Recommendation(
+            stepIndex: compiledStep.index,
+            stepType: compiledStep.type,
+            label: label,
+            diagnosis: "Element \"\(label)\" not found on screen. Visible: \(visible.joined(separator: ", "))",
+            patches: [],
+            screenshotBase64: screenshot
+        )
+    }
+
+    // MARK: - Assertion Diagnosis (assert_visible / assert_not_visible)
+
+    private static func diagnoseAssertion(
+        compiledStep: CompiledStep,
+        matchLabel: String,
+        hints: StepHints,
+        screen: ScreenDescriber.DescribeResult,
+        failureMessage: String?,
+        screenshot: String
+    ) -> Recommendation {
+        let label = compiledStep.label ?? ""
+
+        // An assert_visible that failed: is the element on screen now?
+        if compiledStep.type == "assert_visible" {
+            if ElementMatcher.isVisible(label: matchLabel, in: screen.elements) {
+                let delayMs = hints.observedDelayMs ?? 0
+                return Recommendation(
+                    stepIndex: compiledStep.index,
+                    stepType: compiledStep.type,
+                    label: label,
+                    diagnosis: "Element \"\(label)\" IS visible — compiled assertion delay (\(delayMs)ms) may be too short. Increase observedDelayMs.",
+                    patches: [
+                        Patch(field: "observedDelayMs", was: "\(delayMs)",
+                              shouldBe: "\(delayMs + 1000)")
+                    ],
+                    screenshotBase64: screenshot
+                )
+            }
+
+            let visible = screen.elements.prefix(10).map { "\"\($0.text)\"" }
+            return Recommendation(
+                stepIndex: compiledStep.index,
+                stepType: compiledStep.type,
+                label: label,
+                diagnosis: "Element \"\(label)\" not visible after compiled assertion delay. Screen shows: \(visible.joined(separator: ", ")). Previous step may have navigated to wrong screen.",
+                patches: [],
+                screenshotBase64: screenshot
+            )
+        }
+
+        if compiledStep.type == "assert_not_visible" {
+            if !ElementMatcher.isVisible(label: matchLabel, in: screen.elements) {
+                return Recommendation(
+                    stepIndex: compiledStep.index,
+                    stepType: compiledStep.type,
+                    label: label,
+                    diagnosis: "Element \"\(label)\" is correctly not visible. Step should have passed.",
+                    patches: [],
+                    screenshotBase64: screenshot
+                )
+            }
+
+            return Recommendation(
+                stepIndex: compiledStep.index,
+                stepType: compiledStep.type,
+                label: label,
+                diagnosis: "Element \"\(label)\" is unexpectedly visible. Previous step may not have navigated away.",
+                patches: [],
+                screenshotBase64: screenshot
+            )
+        }
+
+        return Recommendation(
+            stepIndex: compiledStep.index,
+            stepType: compiledStep.type,
+            label: label,
+            diagnosis: failureMessage ?? "Assertion step failed",
+            patches: [],
+            screenshotBase64: screenshot
+        )
+    }
+
+    // MARK: - Scroll Diagnosis
+
+    private static func diagnoseScroll(
+        compiledStep: CompiledStep,
+        matchLabel: String,
+        hints: StepHints,
+        screen: ScreenDescriber.DescribeResult,
+        failureMessage: String?,
+        screenshot: String
+    ) -> Recommendation {
+        let label = compiledStep.label ?? ""
+        let compiledCount = hints.scrollCount ?? 0
+
+        if ElementMatcher.isVisible(label: matchLabel, in: screen.elements) {
+            return Recommendation(
+                stepIndex: compiledStep.index,
+                stepType: compiledStep.type,
+                label: label,
+                diagnosis: "Element \"\(label)\" IS visible after \(compiledCount) scroll(s) — scroll count may need adjustment",
+                patches: [],
+                screenshotBase64: screenshot
+            )
+        }
+
+        let visible = screen.elements.prefix(8).map { "\"\($0.text)\"" }
+        return Recommendation(
+            stepIndex: compiledStep.index,
+            stepType: compiledStep.type,
+            label: label,
+            diagnosis: "Element \"\(label)\" not found after \(compiledCount) compiled scroll(s). Visible: \(visible.joined(separator: ", ")). May need more scrolls.",
+            patches: [
+                Patch(field: "scrollCount", was: "\(compiledCount)",
+                      shouldBe: "\(compiledCount + 2)")
+            ],
+            screenshotBase64: screenshot
+        )
+    }
+
+    // MARK: - Passthrough Diagnosis
+
+    private static func diagnosePassthrough(
+        compiledStep: CompiledStep,
+        screen: ScreenDescriber.DescribeResult,
+        failureMessage: String?,
+        screenshot: String
+    ) -> Recommendation {
+        let visible = screen.elements.prefix(8).map { "\"\($0.text)\"" }
+        return Recommendation(
+            stepIndex: compiledStep.index,
+            stepType: compiledStep.type,
+            label: compiledStep.label,
+            diagnosis: "Passthrough step failed: \(failureMessage ?? "unknown"). Screen shows: \(visible.joined(separator: ", "))",
+            patches: [],
+            screenshotBase64: screenshot
+        )
+    }
+
+    // MARK: - Report Formatting
+
+    /// Format a diagnostic report to stderr.
+    static func printReport(recommendations: [Recommendation], skillName: String) {
+        guard !recommendations.isEmpty else { return }
+
+        fputs("\n--- Agent Diagnostic: \(skillName) ---\n", stderr)
+
+        for rec in recommendations {
+            let label = rec.label.map { " \"\($0)\"" } ?? ""
+            fputs("\nStep \(rec.stepIndex + 1) [\(rec.stepType)\(label)]:\n", stderr)
+            fputs("  Diagnosis: \(rec.diagnosis)\n", stderr)
+
+            for patch in rec.patches {
+                fputs("  Fix: \(patch.field): \(patch.was) -> \(patch.shouldBe)\n", stderr)
+            }
+        }
+
+        if recommendations.contains(where: { !$0.patches.isEmpty }) {
+            fputs("\nRecommendation: recompile with `mirroir compile` or apply patches manually.\n", stderr)
+        }
+
+        fputs("---\n", stderr)
+    }
+
+    private static func fmt(_ value: Double) -> String {
+        String(format: "%.1f", value)
+    }
+
+    // MARK: - AI Diagnosis
+
+    /// Build a diagnostic payload from deterministic recommendations for AI analysis.
+    static func buildPayload(
+        recommendations: [Recommendation],
+        skillName: String,
+        skillFilePath: String
+    ) -> DiagnosticPayload {
+        let steps = recommendations.map { rec in
+            DiagnosticPayload.FailedStep(
+                stepIndex: rec.stepIndex,
+                stepType: rec.stepType,
+                label: rec.label,
+                deterministicDiagnosis: rec.diagnosis,
+                patches: rec.patches.map { p in
+                    DiagnosticPayload.PatchInfo(
+                        field: p.field, was: p.was, shouldBe: p.shouldBe)
+                }
+            )
+        }
+        return DiagnosticPayload(
+            skillName: skillName,
+            skillFilePath: skillFilePath,
+            failedSteps: steps)
+    }
+
+    /// Print AI diagnosis results to stderr.
+    static func printAIReport(diagnosis: AIDiagnosis, skillName: String) {
+        fputs("\n--- AI Diagnosis (\(diagnosis.modelUsed)): \(skillName) ---\n", stderr)
+        fputs("\nAnalysis: \(diagnosis.analysis)\n", stderr)
+
+        if !diagnosis.suggestedFixes.isEmpty {
+            fputs("\nSuggested Fixes:\n", stderr)
+            for fix in diagnosis.suggestedFixes {
+                fputs("  \(fix.field): \(fix.was) -> \(fix.shouldBe)\n", stderr)
+            }
+        }
+
+        fputs("Confidence: \(diagnosis.confidence)\n", stderr)
+        fputs("---\n", stderr)
+    }
+}
+
+/// Diagnostic context sent to an AI agent for analysis.
+struct DiagnosticPayload: Codable {
+    let skillName: String
+    let skillFilePath: String
+    let failedSteps: [FailedStep]
+
+    struct FailedStep: Codable {
+        let stepIndex: Int
+        let stepType: String
+        let label: String?
+        let deterministicDiagnosis: String
+        let patches: [PatchInfo]
+    }
+
+    struct PatchInfo: Codable {
+        let field: String
+        let was: String
+        let shouldBe: String
+    }
+}

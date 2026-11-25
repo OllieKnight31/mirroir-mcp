@@ -1,0 +1,23 @@
+/target/
+*.compiled.json.tmp
+# Review artifacts a run writes under the invocation directory: the last-green
+# baseline drift is measured against, and the candidate rows a human reviews.
+# Ignored here because the only runs invoked from runner/ are the fixture and
+# mega-sample suites, whose baselines are scratch. A consumer repo that wants
+# cross-run drift detection commits its own .harness/ — see
+# docs/drift-and-accept.md.
+/.harness/
+# The web half of the cross-surface parity gate: `scenarios/parity.yaml` writes
+# it from the live page on every run, so it is an output, not a fixture. Its
+# counterpart `baselines/parity.ios.txt` IS committed — that surface has no
+# producer here.
+/samples/web-fixture/baselines/parity.web.txt
+# The live iOS capture `samples/ios-fixture/scenarios/settings-list.yaml`
+# writes on every run; `expected/settings-list.txt` is the committed half.
+/samples/ios-fixture/baselines/
+# The screen baselines the game samples' first run records next to each
+# scenario. They belong to the host that recorded them: a device run and a
+# FakeMirroring run see different screens, so one host's baseline is the
+# other's drift. Each run starts from none and records its own.
+/samples/game-shell/scenarios/*.ios.compiled.json
+/samples/game-result/scenarios/*.ios.compiled.json

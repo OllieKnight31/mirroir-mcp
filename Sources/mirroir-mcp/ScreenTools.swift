@@ -1,0 +1,423 @@
+/*
+ * Copyright 2026 Async-IO.org
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License"); you may not
+ * use this file except in compliance with the License. You may obtain a copy of
+ * the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ */
+// ABOUTME: Registers screen-related MCP tools: screenshot, describe_screen, start/stop recording.
+// ABOUTME: Each tool maps MCP JSON-RPC calls to the capture, recorder, and describer subsystems.
+
+import CoreGraphics
+import Foundation
+import HelperLib
+
+extension MirroirMCP {
+    /// The `settle_ms` argument of the screenshot and describe_screen tools in
+    /// microseconds, or nil when absent. Negative values clamp to 0 and values
+    /// past `frameSettleMaxTimeoutUs` clamp to it, so no input can overflow the
+    /// conversion or hold the handler for longer than the cap.
+    static func settleTimeoutUs(from args: [String: JSONValue]) -> UInt32? {
+        guard let ms = args["settle_ms"]?.asInt() else { return nil }
+        let maxMs = Int(EnvConfig.frameSettleMaxTimeoutUs / 1000)
+        return UInt32(clamping: min(max(0, ms), maxMs)) * 1000
+    }
+
+    static func registerScreenTools(
+        server: MCPServer,
+        registry: TargetRegistry
+    ) {
+        // screenshot — capture the mirroring window
+        server.registerTool(MCPToolDefinition(
+            name: "screenshot",
+            description: """
+                Capture a screenshot of the iPhone Mirroring window. \
+                Returns the current screen content as a PNG image. \
+                Use this to see what is displayed on the mirrored iPhone. \
+                The reply states the image's pixel size and the window points it \
+                shows. tap takes points, not pixels: to tap a point seen in the \
+                image, give tap its position with image_size.
+
+                By default the capture waits for the screen to stop changing, \
+                because the mirrored frame lags the device: a capture taken \
+                immediately after an action can still show the pre-action \
+                screen. Never retry an action that "looks like a no-op" — the \
+                first one landed, so the retry fires on the next screen and \
+                mis-taps. Use settle_ms to tune the wait, or 0 to disable it.
+                """,
+            inputSchema: [
+                "type": .string("object"),
+                "properties": .object([
+                    "settle_ms": .object([
+                        "type": .string("integer"),
+                        "description": .string(
+                            "How long to wait for two consecutive identical frames before "
+                            + "returning, in milliseconds. 0 returns the first frame "
+                            + "immediately, which may be stale. Defaults to the "
+                            + "frameSettleTimeoutUs setting."),
+                    ]),
+                    "scale": .object([
+                        "type": .string("number"),
+                        "description": .string(
+                            "Optional output scale factor in (0, 1] to downscale the returned "
+                            + "PNG and cut its vision-token cost. 1 (default) keeps full "
+                            + "resolution; 0.5 halves each dimension (~4x fewer pixels)."),
+                    ]),
+                    "region": .object([
+                        "type": .string("array"),
+                        "description": .string(
+                            "Optional crop rectangle [x, y, width, height] in window points "
+                            + "(same 0,0 = top-left space as tap coordinates). Returns only "
+                            + "that sub-rectangle, cutting token cost. Omit for the full frame."),
+                    ]),
+                ]),
+            ],
+            handler: { args in
+                let (ctx, err) = registry.resolveForTool(args)
+                guard let ctx else { return err! }
+                let bridge = ctx.bridge
+                let capture = ctx.capture
+
+                guard bridge.findProcess() != nil else {
+                    return .error("Target '\(ctx.name)' is not running")
+                }
+
+                // Read-only: a paused session is captured as it is (the overlay
+                // shows), never resumed — the user may have paused it on purpose.
+
+                // A settle window of 0 is an explicit opt-out: the caller wants
+                // the first available frame and accepts that it may be stale.
+                let settleUs = settleTimeoutUs(from: args) ?? EnvConfig.frameSettleTimeoutUs
+                guard let captured = capture.captureSettledWithInfo(timeoutUs: settleUs) else {
+                    return .error(ScreenReadFailure.message(
+                        "Failed to capture screenshot.", targetName: ctx.name, state: bridge.getState()))
+                }
+
+                // Optional token lever: crop to a region and/or downscale before
+                // returning, so a caller (e.g. a kind:game scene loop) can trade
+                // frame detail for fewer vision tokens per frame.
+                let scale = args["scale"]?.asNumber()
+                var region: CGRect?
+                if case .array(let r)? = args["region"], r.count == 4,
+                   let x = r[0].asNumber(), let y = r[1].asNumber(),
+                   let w = r[2].asNumber(), let h = r[3].asNumber() {
+                    region = CGRect(x: x, y: y, width: w, height: h)
+                }
+
+                let pngData: Data
+                if scale != nil || region != nil {
+                    guard let transformed = ScreenshotRegionScaler.transform(
+                        pngData: captured.data, windowSize: captured.info.size,
+                        region: region, scale: scale
+                    ) else {
+                        return .error("Failed to apply scale/region to the screenshot")
+                    }
+                    pngData = transformed
+                } else {
+                    pngData = captured.data
+                }
+
+                let image = MCPContent.image(pngData.base64EncodedString(), mimeType: "image/png")
+                guard let geometry = ScreenshotGeometry.of(
+                    png: pngData, windowSize: captured.info.size, region: region) else {
+                    return MCPToolResult(content: [image], isError: false)
+                }
+                return MCPToolResult(content: [.text(geometry.summary), image], isError: false)
+            }
+        ))
+
+        // describe_screen — OCR-based screen element detection with tap coordinates
+        server.registerTool(MCPToolDefinition(
+            name: "describe_screen",
+            description: """
+                Analyze the iPhone screen using OCR and return all visible text elements \
+                with their exact tap coordinates. Use this instead of visually estimating \
+                positions from screenshots. Returns both a structured text list of elements \
+                and the screenshot image. Coordinates are in the same point system as the \
+                tap tool (0,0 = top-left of mirroring window). \
+                Set scroll to true to scroll through the full page and collect all elements \
+                with page-absolute Y coordinates. \
+                With screenDescriberMode set to vision, elements come from an LLM vision \
+                call instead of OCR and their coordinates are approximate: elements near \
+                the bottom of the screen can come back placed too high. \
+                The call first waits for the screen to stop changing, because the mirrored \
+                frame lags the device: a frame taken right after an action can still show \
+                the pre-action screen (and in vision mode a transitional frame would still \
+                be billed). Use settle_ms to tune the wait, or 0 on a constantly animated \
+                screen such as a game, which never settles. \
+                To read one value, pass query (only elements containing that text \
+                are listed) and text_only (no coordinates) with omit_screenshot. \
+                On a macOS app target, text the app itself reports through \
+                Accessibility is marked [tree]: it is exact, where unmarked text was \
+                read from pixels and may be misread.
+                """,
+            inputSchema: [
+                "type": .string("object"),
+                "properties": .object([
+                    "scroll": .object([
+                        "type": .string("boolean"),
+                        "description": .string(
+                            "Scroll through the full page to collect all elements with page-absolute Y coordinates (default: false). "
+                            + "The reply's _meta says why the scrolling stopped: stop_reason=end_of_content when the list ended, "
+                            + "max_scrolls when it was still going"),
+                    ]),
+                    "max_scrolls": .object([
+                        "type": .string("integer"),
+                        "description": .string(
+                            "With scroll: true, the most scrolls to make (default: \(EnvConfig.defaultScrollMaxAttempts))"),
+                    ]),
+                    "at": .object([
+                        "type": .string("array"),
+                        "description": .string(
+                            "With scroll: true, the point [x, y] in window points to scroll at, for a list inside the "
+                            + "screen (a carousel, a sheet). Default: the page."),
+                    ]),
+                    "omit_screenshot": .object([
+                        "type": .string("boolean"),
+                        "description": .string(
+                            "Omit the screenshot image from the response to save context window space (default: uses MIRROIR_OMIT_SCREENSHOT env var, or false)"),
+                    ]),
+                    "query": .object([
+                        "type": .string("string"),
+                        "description": .string(
+                            "List only elements whose text contains this, ignoring case "
+                            + "and accents (e.g. \"°\" for temperatures). Icons are omitted."),
+                    ]),
+                    "text_only": .object([
+                        "type": .string("boolean"),
+                        "description": .string(
+                            "List element text without tap coordinates (default: false)"),
+                    ]),
+                    "settle_ms": .object([
+                        "type": .string("integer"),
+                        "description": .string(
+                            "How long to wait for two consecutive identical frames before "
+                            + "describing, in milliseconds. 0 describes the first frame, "
+                            + "which may be stale. Defaults to the frameSettleTimeoutUs "
+                            + "setting in both OCR and vision mode."),
+                    ]),
+                ]),
+            ],
+            handler: { args in
+                let (ctx, err) = registry.resolveForTool(args)
+                guard let ctx else { return err! }
+                let bridge = ctx.bridge
+                let describer = ctx.describer
+
+                guard bridge.findProcess() != nil else {
+                    return .error("Target '\(ctx.name)' is not running")
+                }
+                // Read-only: a paused session is described as it is, never resumed.
+                let paused = bridge.getState() == .paused
+
+                let scrollEnabled = args["scroll"]?.asBool() ?? false
+                let omitScreenshot = args["omit_screenshot"]?.asBool() ?? EnvConfig.describeScreenOmitScreenshot
+                let query = args["query"]?.asString()
+                    .flatMap { $0.trimmingCharacters(in: .whitespaces).isEmpty ? nil : $0 }
+                let textOnly = args["text_only"]?.asBool() ?? false
+
+                // max_scrolls and at only shape a scrolling read: refuse them alone
+                // rather than read one screen and drop them unsaid.
+                if !scrollEnabled {
+                    let scrollOnly = ["max_scrolls", "at"].filter { args[$0] != nil }
+                    if !scrollOnly.isEmpty {
+                        let verb = scrollOnly.count == 1 ? "applies" : "apply"
+                        return .error("\(scrollOnly.joined(separator: " and ")) \(verb) only with scroll: true")
+                    }
+                }
+
+                // Full-page scroll mode: collect all elements across viewports
+                if scrollEnabled {
+                    let input = ctx.input
+                    let maxScrolls = args["max_scrolls"]?.asInt() ?? EnvConfig.defaultScrollMaxAttempts
+                    guard maxScrolls >= 1 else {
+                        return .error("max_scrolls must be at least 1, got \(maxScrolls)")
+                    }
+                    let anchor: CGPoint?
+                    switch ScrollAnchorArgument.parse(args["at"], bridge: bridge) {
+                    case .absent: anchor = nil
+                    case .point(let point): anchor = point
+                    case .invalid(let message): return .error(message)
+                    }
+                    guard let scrollResult = describer.describeFullPage(
+                        input: input, bridge: bridge, maxScrolls: maxScrolls, anchor: anchor
+                    ) else {
+                        return .error(ScreenReadFailure.message(
+                            "Failed to capture/analyze screen.", targetName: ctx.name,
+                            state: ctx.bridge.getState()))
+                    }
+
+                    var lines = [DescribeScreenFilter.header(
+                        coordinates: "page-absolute tap coordinates in points",
+                        elements: scrollResult.elements)]
+                    let listed = DescribeScreenFilter.matching(query, in: scrollResult.elements)
+                    lines += DescribeScreenFilter.lines(for: listed, textOnly: textOnly)
+                    if scrollResult.elements.isEmpty {
+                        lines.append("(no text detected)")
+                    } else if let query, listed.isEmpty {
+                        lines.append(DescribeScreenFilter.noMatchLine(
+                            query: query, onScreen: scrollResult.elements.count))
+                    }
+                    lines.append("")
+                    lines.append("_meta: scroll_count=\(scrollResult.scrollCount) "
+                        + "stop_reason=\(scrollResult.stopReason.rawValue) total_offset=\(Int(scrollResult.totalScrollOffset)) element_count=\(scrollResult.elements.count)"
+                        + DescribeScreenFilter.sourceCounts(scrollResult.elements, truncated: false))
+                    let description = lines.joined(separator: "\n")
+
+                    let scrollContent: [MCPContent] = omitScreenshot
+                        ? [.text(description)]
+                        : [.text(description), .image(scrollResult.screenshotBase64, mimeType: "image/png")]
+                    return MCPToolResult(content: scrollContent, isError: false)
+                }
+
+                // A client describe usually follows an action, so it settles by
+                // default in every describer mode, exactly like the screenshot
+                // tool. Server-internal polls call describe() without a window
+                // and keep the describer's own (OCR: no settle) policy.
+                let settleUs = settleTimeoutUs(from: args) ?? EnvConfig.frameSettleTimeoutUs
+                guard let result = describer.describe(settleTimeoutUs: settleUs) else {
+                    return .error(ScreenReadFailure.message(
+                        "Failed to capture/analyze screen.", targetName: ctx.name,
+                        state: ctx.bridge.getState()))
+                }
+
+                var lines = [DescribeScreenFilter.header(
+                    coordinates: "tap coordinates in points", elements: result.elements)]
+                let listed = DescribeScreenFilter.matching(query, in: result.elements)
+                lines += DescribeScreenFilter.lines(for: listed, textOnly: textOnly)
+                if let query, listed.isEmpty, !result.elements.isEmpty {
+                    lines.append(DescribeScreenFilter.noMatchLine(
+                        query: query, onScreen: result.elements.count))
+                }
+                if let failure = result.ocrFailure {
+                    // Never report a broken engine as a blank screen: the two
+                    // look identical in the element list and only one of them
+                    // means the screen is actually empty.
+                    lines.append("(OCR FAILED — text recognition did not run: \(failure))")
+                    lines.append("Any icons and hints below come from the non-OCR path; "
+                        + "the text layer is missing, not empty.")
+                } else if result.screenBlank {
+                    lines.append("(SCREEN BLANK — the frame is a uniform fill with no text or "
+                        + "icons: the device is transitioning (rotation, launch, scene change). "
+                        + "Describe again once the screen has drawn.)")
+                } else if result.elements.isEmpty {
+                    lines.append("(no text detected)")
+                }
+                if let failure = result.treeFailure {
+                    lines.append("(accessibility tree not readable: \(failure); every element "
+                        + "is read from pixels)")
+                }
+                if !result.icons.isEmpty, query == nil {
+                    lines.append("")
+                    lines.append("Unlabeled icons (estimated positions):")
+                    for icon in result.icons.sorted(by: { $0.tapX < $1.tapX }) {
+                        lines.append("- Icon at (\(Int(icon.tapX)), \(Int(icon.tapY))), ~\(Int(icon.estimatedSize))x\(Int(icon.estimatedSize))pt")
+                    }
+                }
+                if !result.hints.isEmpty {
+                    lines.append("")
+                    lines.append("Hints:")
+                    for hint in result.hints {
+                        lines.append("- \(hint)")
+                    }
+                }
+                if paused {
+                    lines.append("")
+                    lines.append("Note: '\(ctx.name)' is paused, so this frame shows the "
+                        + "interruption, not the app. Nothing was pressed to resume it.")
+                }
+                lines.append("")
+                lines.append("_meta: ocr_time_ms=\(result.ocrTimeMs) recognition_level=\(EnvConfig.ocrRecognitionLevel) element_count=\(result.elements.count)"
+                    + DescribeScreenFilter.sourceCounts(result.elements, truncated: result.treeTruncated)
+                    + (result.ocrFailure == nil ? "" : " ocr_status=failed")
+                    + (result.screenBlank ? " screen_blank=true" : "")
+                    + (result.visionUsage.map {
+                        " vision_prompt_tokens=\($0.promptTokens)"
+                            + " vision_completion_tokens=\($0.completionTokens)"
+                            + " vision_total_tokens=\($0.totalTokens)"
+                    } ?? ""))
+                let description = lines.joined(separator: "\n")
+
+                let content: [MCPContent] = omitScreenshot
+                    ? [.text(description)]
+                    : [.text(description), .image(result.screenshotBase64, mimeType: "image/png")]
+                return MCPToolResult(content: content, isError: false)
+            }
+        ))
+
+        // start_recording — begin video recording of the mirroring window
+        server.registerTool(MCPToolDefinition(
+            name: "start_recording",
+            description: """
+                Start recording a video of the mirrored iPhone screen. \
+                Records the iPhone Mirroring window as a .mov file, keeping the \
+                Mac's display awake until it stops. \
+                Use stop_recording to end the recording and get the file path. \
+                Requires Screen Recording permission in System Preferences.
+                """,
+            inputSchema: [
+                "type": .string("object"),
+                "properties": .object([
+                    "output_path": .object([
+                        "type": .string("string"),
+                        "description": .string(
+                            "Optional file path for the recording (default: temp directory)"),
+                    ])
+                ]),
+            ],
+            handler: { args in
+                let (ctx, err) = registry.resolveForTool(args)
+                guard let ctx else { return err! }
+                let recorder = ctx.recorder
+
+                let outputPath = args["output_path"]?.asString()
+
+                if let error = recorder.startRecording(outputPath: outputPath) {
+                    return .error(error)
+                }
+                return .text("Recording started")
+            }
+        ))
+
+        // stop_recording — stop video recording and return the file path
+        server.registerTool(MCPToolDefinition(
+            name: "stop_recording",
+            description: """
+                Stop the current video recording and return the file path. \
+                Must be called after start_recording. Returns the path to \
+                the recorded .mov file. If the recording had already ended on \
+                its own (display sleep can end it), it still returns the file \
+                and says the video stops early.
+                """,
+            inputSchema: [
+                "type": .string("object"),
+                "properties": .object([:]),
+            ],
+            handler: { args in
+                let (ctx, err) = registry.resolveForTool(args)
+                guard let ctx else { return err! }
+                let recorder = ctx.recorder
+
+                let result = recorder.stopRecording()
+                if let error = result.error {
+                    return .error(error)
+                }
+                guard let path = result.filePath else {
+                    return .error("Recording stopped but no file was produced")
+                }
+                if let endedEarly = result.endedEarly {
+                    return .text("Recording saved to: \(path). Note: \(endedEarly), so the video stops there.")
+                }
+                return .text("Recording saved to: \(path)")
+            }
+        ))
+    }
+}

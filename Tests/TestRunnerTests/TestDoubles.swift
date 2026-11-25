@@ -1,0 +1,199 @@
+/*
+ * Copyright 2026 Async-IO.org
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License"); you may not
+ * use this file except in compliance with the License. You may obtain a copy of
+ * the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ */
+// ABOUTME: Stub implementations of protocol abstractions for test runner unit tests.
+// ABOUTME: Each stub returns configurable values, enabling tests without real macOS system APIs.
+
+import AppKit
+import CoreGraphics
+import Foundation
+@testable import HelperLib
+@testable import mirroir_mcp
+
+// MARK: - StubBridge
+
+final class StubBridge: MenuActionCapable, @unchecked Sendable {
+    var targetName: String = "iphone"
+    var windowInfo: WindowInfo? = WindowInfo(
+        windowID: 1,
+        position: .zero,
+        size: CGSize(width: 410, height: 898),
+        pid: 1
+    )
+    var state: WindowState = .connected
+    var orientation: DeviceOrientation? = .portrait
+    var menuActionResult = true
+    var pressResumeResult = true
+    var processRunning = true
+    var menuActionCalls: [(menu: String, item: String)] = []
+
+    func findProcess() -> NSRunningApplication? {
+        processRunning ? NSRunningApplication.current : nil
+    }
+
+    func getWindowInfo() -> WindowInfo? {
+        windowInfo
+    }
+
+    func getState() -> WindowState {
+        state
+    }
+
+    func getOrientation() -> DeviceOrientation? {
+        orientation
+    }
+
+    func activate() {}
+
+    func triggerMenuAction(menu: String, item: String) -> Bool {
+        menuActionCalls.append((menu: menu, item: item))
+        return menuActionResult
+    }
+
+    func pressResume() -> Bool {
+        pressResumeResult
+    }
+}
+
+// MARK: - StubInput
+
+final class StubInput: InputProviding, @unchecked Sendable {
+    var tapResult: String?
+    var swipeResult: String?
+    var dragResult: String?
+    var longPressResult: String?
+    var doubleTapResult: String?
+    var shakeResult = TypeResult(success: true, error: nil)
+    var typeTextResult = TypeResult(success: true, error: nil)
+    var pressKeyResult = TypeResult(success: true, error: nil)
+    var launchAppResult: String?
+    var openURLResult: String?
+    var tapCalls: [(x: Double, y: Double)] = []
+    var swipeCalls: [(fromX: Double, fromY: Double, toX: Double, toY: Double)] = []
+    var dragCalls: [(fromX: Double, fromY: Double, toX: Double, toY: Double)] = []
+    var launchAppCalls: [String] = []
+
+    func tap(x: Double, y: Double, cursorMode: CursorMode? = nil) -> String? {
+        tapCalls.append((x: x, y: y))
+        return tapResult
+    }
+    func swipe(fromX: Double, fromY: Double, toX: Double, toY: Double,
+               durationMs: Int, cursorMode: CursorMode? = nil) -> String? {
+        swipeCalls.append((fromX: fromX, fromY: fromY, toX: toX, toY: toY))
+        return swipeResult
+    }
+    func drag(fromX: Double, fromY: Double, toX: Double, toY: Double,
+              durationMs: Int, cursorMode: CursorMode? = nil) -> String? {
+        dragCalls.append((fromX: fromX, fromY: fromY, toX: toX, toY: toY))
+        return dragResult
+    }
+    func longPress(x: Double, y: Double, durationMs: Int, cursorMode: CursorMode? = nil) -> String? { longPressResult }
+    func doubleTap(x: Double, y: Double, cursorMode: CursorMode? = nil) -> String? { doubleTapResult }
+    /// How many times shake() was called.
+    var shakeCalls = 0
+    func shake() -> TypeResult {
+        shakeCalls += 1
+        return shakeResult
+    }
+    func typeText(_ text: String) -> TypeResult { typeTextResult }
+    func rememberKeyboardLayout(_ name: String) -> String? { nil }
+    /// Every pressKey() call as "<modifiers+>key", in order.
+    var pressKeyCalls: [String] = []
+    func pressKey(keyName: String, modifiers: [String]) -> TypeResult {
+        pressKeyCalls.append((modifiers + [keyName]).joined(separator: "+"))
+        return pressKeyResult
+    }
+    /// What `ensureConnected` answers: nil for a connected target, else the refusal.
+    var ensureConnectedResult: String?
+    func ensureConnected(tag: String) -> String? { ensureConnectedResult }
+    func launchApp(name: String) -> String? {
+        launchAppCalls.append(name)
+        return launchAppResult
+    }
+    func openURL(_ url: String) -> String? { openURLResult }
+    func touch(_ command: TouchCommand) -> Result<TouchOutcome, TouchSessionError> {
+        .failure(.rejected("StubInput does not hold touches"))
+    }
+    func gesture(_ request: GestureRequest) -> String? { nil }
+    func holdKeys(_ request: HeldKeysRequest) -> String? { nil }
+}
+
+// MARK: - StubCapture
+
+final class StubCapture: ScreenCapturing, @unchecked Sendable {
+    var captureResult: String?
+    var windowInfo: WindowInfo = WindowInfo(
+        windowID: 1, position: .zero, size: CGSize(width: 410, height: 898), pid: 1
+    )
+
+    func captureWithInfo() -> CaptureResult? {
+        guard let data = captureData() else { return nil }
+        return CaptureResult(data: data, info: windowInfo)
+    }
+
+    func captureData() -> Data? {
+        guard let captureResult else { return nil }
+        return Data(base64Encoded: captureResult)
+    }
+
+    func captureBase64() -> String? {
+        captureResult
+    }
+}
+
+// MARK: - StubAIProvider
+
+final class StubAIProvider: AIAgentProviding, @unchecked Sendable {
+    var diagnosisResult: AIDiagnosis?
+    var lastPayload: DiagnosticPayload?
+
+    func diagnose(payload: DiagnosticPayload) -> AIDiagnosis? {
+        lastPayload = payload
+        return diagnosisResult
+    }
+}
+
+// MARK: - StubDescriber
+
+final class StubDescriber: ScreenDescribing, @unchecked Sendable {
+    var describeResult: ScreenDescriber.DescribeResult?
+    /// Sequential results returned one per call. When exhausted, repeats the last one.
+    var describeResults: [ScreenDescriber.DescribeResult?] = []
+    private var callCount = 0
+
+    func describe(settleTimeoutUs: UInt32?) -> ScreenDescriber.DescribeResult? {
+        if !describeResults.isEmpty {
+            let result = describeResults[min(callCount, describeResults.count - 1)]
+            callCount += 1
+            return result
+        }
+        return describeResult
+    }
+}
+
+// MARK: - StubRecorder
+
+final class StubRecorder: ScreenRecording, @unchecked Sendable {
+    var startResult: String?
+    var stopResult = RecordingStop(filePath: "/tmp/test.mov", error: nil)
+
+    func startRecording(outputPath: String?) -> String? {
+        startResult
+    }
+
+    func stopRecording() -> RecordingStop {
+        stopResult
+    }
+}

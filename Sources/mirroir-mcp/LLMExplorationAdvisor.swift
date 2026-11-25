@@ -1,0 +1,165 @@
+/*
+ * Copyright 2026 Async-IO.org
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License"); you may not
+ * use this file except in compliance with the License. You may obtain a copy of
+ * the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ */
+// ABOUTME: Uses AI vision (embacle) to suggest exploration actions when BFS hits a plateau.
+// ABOUTME: Protocol abstraction allowing test doubles; concrete implementation queries embacle.
+
+import Foundation
+import HelperLib
+
+/// Suggestion from the AI advisor for what to explore next.
+struct ExplorationSuggestion: Sendable {
+    /// The element text recommended for tapping.
+    let elementText: String
+    /// Reasoning for why this element was suggested.
+    let reasoning: String
+    /// Confidence score (0.0-1.0).
+    let confidence: Double
+}
+
+/// Heuristic-based exploration advisor that scores untapped elements
+/// by position, label characteristics, and context — no external API call.
+/// Falls back to this when embacle is unavailable or in test environments.
+struct HeuristicExplorationAdvisor: ExplorationAdvising {
+
+    func suggest(
+        screenshotBase64: String,
+        elements: [TapPoint],
+        visitedElements: Set<String>,
+        exploredScreenCount: Int
+    ) -> [ExplorationSuggestion] {
+        let untapped = elements.filter { !visitedElements.contains($0.text) }
+        guard !untapped.isEmpty else { return [] }
+
+        return untapped
+            .sorted { scoreElement($0) > scoreElement($1) }
+            .prefix(3)
+            .map { element in
+                ExplorationSuggestion(
+                    elementText: element.text,
+                    reasoning: "Heuristic: untapped element at y=\(Int(element.tapY))",
+                    confidence: 0.5
+                )
+            }
+    }
+
+    /// Score an element based on heuristics: mid-screen position, short label, etc.
+    private func scoreElement(_ element: TapPoint) -> Double {
+        var score: Double = 0
+        // Mid-screen elements are more likely to be navigation targets
+        if element.tapY > 200 && element.tapY < 700 { score += 2.0 }
+        // Short labels are more likely to be tappable menu items
+        if element.text.count <= 20 { score += 1.5 }
+        // Very short labels might be icons or buttons
+        if element.text.count <= 5 { score += 1.0 }
+        return score
+    }
+}
+
+/// Vision-based exploration advisor using embacle FFI for screen analysis.
+/// Sends the current screenshot to embacle and asks it to identify the most
+/// promising untapped element for discovering new screens.
+struct VisionExplorationAdvisor: ExplorationAdvising {
+
+    /// Bare Copilot model id sent with every request: the configured agent's
+    /// model, chosen only when `AIAgentRegistry.embeddedAgentModel()` says the
+    /// embedded runner serves that agent.
+    let model: String
+
+    private static var timeoutSeconds: Int { EnvConfig.embacleTimeoutSeconds }
+
+    /// The reply is one element's text, so a short completion is enough.
+    private static let replyMaxTokens = 100
+
+    func suggest(
+        screenshotBase64: String,
+        elements: [TapPoint],
+        visitedElements: Set<String>,
+        exploredScreenCount: Int
+    ) -> [ExplorationSuggestion] {
+        let untapped = elements.filter { !visitedElements.contains($0.text) }
+        guard !untapped.isEmpty else { return [] }
+        guard EmbacleFFI.isAvailable else {
+            return HeuristicExplorationAdvisor().suggest(
+                screenshotBase64: screenshotBase64, elements: elements,
+                visitedElements: visitedElements, exploredScreenCount: exploredScreenCount
+            )
+        }
+
+        let elementList = untapped.map { "\($0.text) at (\(Int($0.tapX)),\(Int($0.tapY)))" }
+            .joined(separator: ", ")
+
+        let prompt = "This is a screenshot of an iOS app during automated exploration. " +
+            "\(exploredScreenCount) screens have been discovered so far. " +
+            "These elements have NOT been tapped yet: \(elementList). " +
+            "Which element is most likely to lead to a new, undiscovered screen? " +
+            "Reply with ONLY the element text, nothing else."
+
+        guard let responseText = sendVisionRequest(
+            imageBase64: screenshotBase64, prompt: prompt
+        ) else {
+            return HeuristicExplorationAdvisor().suggest(
+                screenshotBase64: screenshotBase64, elements: elements,
+                visitedElements: visitedElements, exploredScreenCount: exploredScreenCount
+            )
+        }
+
+        let trimmed = responseText.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
+
+        // Exact match against untapped element text
+        if let match = untapped.first(where: { $0.text == trimmed }) {
+            return [ExplorationSuggestion(
+                elementText: match.text,
+                reasoning: "Vision advisor recommended this element",
+                confidence: 0.8
+            )]
+        }
+
+        // Fuzzy match: check if the response contains an element text
+        if let fuzzyMatch = untapped.first(where: {
+            trimmed.localizedCaseInsensitiveContains($0.text) ||
+            $0.text.localizedCaseInsensitiveContains(trimmed)
+        }) {
+            return [ExplorationSuggestion(
+                elementText: fuzzyMatch.text,
+                reasoning: "Vision advisor fuzzy match: \"\(trimmed)\"",
+                confidence: 0.6
+            )]
+        }
+
+        // Vision response didn't match any element — fall back to heuristic
+        return HeuristicExplorationAdvisor().suggest(
+            screenshotBase64: screenshotBase64, elements: elements,
+            visitedElements: visitedElements, exploredScreenCount: exploredScreenCount
+        )
+    }
+
+    /// Ask the embedded runner about the screenshot; nil when it gives no answer.
+    private func sendVisionRequest(imageBase64: String, prompt: String) -> String? {
+        requestChatCompletion(
+            systemPrompt: nil,
+            userText: "",
+            image: ChatCompletionImage(pngBase64: imageBase64, caption: prompt),
+            model: model,
+            maxTokens: Self.replyMaxTokens,
+            agentConfig: AgentConfig(
+                name: "vision-advisor", mode: .api, provider: nil, model: model,
+                apiKeyEnvVar: nil, baseURL: nil, systemPrompt: nil,
+                maxTokens: Self.replyMaxTokens, command: nil, args: nil),
+            transport: .embedded,
+            timeoutSeconds: Self.timeoutSeconds
+        )?.text
+    }
+}

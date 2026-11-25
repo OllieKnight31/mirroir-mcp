@@ -1,0 +1,395 @@
+/*
+ * Copyright 2026 Async-IO.org
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License"); you may not
+ * use this file except in compliance with the License. You may obtain a copy of
+ * the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ */
+// ABOUTME: JSON-based configuration overrides for timing and numeric constants.
+// ABOUTME: Reads settings.json first, then MIRROIR_* env vars, falling back to TimingConstants.
+
+import Foundation
+
+/// Reads timing and numeric constants from a `settings.json` config file, falling back
+/// to `MIRROIR_*` environment variables, then to ``TimingConstants`` defaults.
+///
+/// Resolution order for each key (first found wins):
+/// 1. `settings.json` value (project-local `<cwd>/.mirroir-mcp/settings.json`,
+///    then global `~/.mirroir-mcp/settings.json`; or the one file
+///    `MIRROIR_SETTINGS_FILE` names, which replaces both)
+/// 2. `MIRROIR_<SCREAMING_SNAKE_CASE>` environment variable
+/// 3. ``TimingConstants`` default
+///
+/// Example `settings.json`:
+/// ```json
+/// {
+///   "cursorSettleUs": 20000,
+///   "clickHoldUs": 100000,
+///   "mirroringBundleID": "com.apple.ScreenContinuity"
+/// }
+/// ```
+public enum EnvConfig {
+    /// Loaded settings dictionary. Lazily initialized once from settings.json.
+    nonisolated(unsafe) static let settings: [String: Any] = loadSettings(
+        environment: env,
+        localConfigDir: PermissionPolicy.localConfigDir,
+        globalConfigDir: PermissionPolicy.globalConfigDir)
+
+    // MARK: - Cursor & Input Settling
+
+    public static var cursorSettleUs: UInt32 {
+        readUInt32("cursorSettleUs", default: TimingConstants.cursorSettleUs)
+    }
+
+    public static var clickHoldUs: UInt32 {
+        readUInt32("clickHoldUs", default: TimingConstants.clickHoldUs)
+    }
+
+    public static var doubleTapHoldUs: UInt32 {
+        readUInt32("doubleTapHoldUs", default: TimingConstants.doubleTapHoldUs)
+    }
+
+    public static var doubleTapGapUs: UInt32 {
+        readUInt32("doubleTapGapUs", default: TimingConstants.doubleTapGapUs)
+    }
+
+    public static var dragModeHoldUs: UInt32 {
+        readUInt32("dragModeHoldUs", default: TimingConstants.dragModeHoldUs)
+    }
+
+    public static var focusSettleUs: UInt32 {
+        readUInt32("focusSettleUs", default: TimingConstants.focusSettleUs)
+    }
+
+    public static var keystrokeDelayUs: UInt32 {
+        readUInt32("keystrokeDelayUs", default: TimingConstants.keystrokeDelayUs)
+    }
+
+    public static var pasteboardSyncUs: UInt32 {
+        readUInt32("pasteboardSyncUs", default: TimingConstants.pasteboardSyncUs)
+    }
+
+    public static var pasteVerifyTimeoutUs: UInt32 {
+        readUInt32("pasteVerifyTimeoutUs", default: TimingConstants.pasteVerifyTimeoutUs)
+    }
+
+    public static var pasteVerifyPollUs: UInt32 {
+        readUInt32("pasteVerifyPollUs", default: TimingConstants.pasteVerifyPollUs)
+    }
+
+    public static var pasteVerifyWindowChars: Int {
+        readInt("pasteVerifyWindowChars", default: TimingConstants.pasteVerifyWindowChars)
+    }
+
+    public static var frameSettlePollUs: UInt32 {
+        readUInt32("frameSettlePollUs", default: TimingConstants.frameSettlePollUs)
+    }
+
+    public static var frameSettleTimeoutUs: UInt32 {
+        readUInt32("frameSettleTimeoutUs", default: TimingConstants.frameSettleTimeoutUs)
+    }
+
+    public static var frameSettleMaxTimeoutUs: UInt32 {
+        readUInt32("frameSettleMaxTimeoutUs", default: TimingConstants.frameSettleMaxTimeoutUs)
+    }
+
+    public static var blankFrameSampleSize: Int {
+        readInt("blankFrameSampleSize", default: TimingConstants.blankFrameSampleSize)
+    }
+
+    public static var blankFrameLuminanceTolerance: Int {
+        readInt("blankFrameLuminanceTolerance", default: TimingConstants.blankFrameLuminanceTolerance)
+    }
+
+    public static var blankFrameMaxContentFraction: Double {
+        readDouble("blankFrameMaxContentFraction", default: TimingConstants.blankFrameMaxContentFraction)
+    }
+
+    // MARK: - App Switching & Navigation
+
+    public static var spaceSwitchSettleUs: UInt32 {
+        readUInt32("spaceSwitchSettleUs", default: TimingConstants.spaceSwitchSettleUs)
+    }
+
+    public static var windowGeometryRecheckUs: UInt32 {
+        readUInt32("windowGeometryRecheckUs", default: TimingConstants.windowGeometryRecheckUs)
+    }
+
+    public static var activationConfirmTimeoutUs: UInt32 {
+        readUInt32("activationConfirmTimeoutUs", default: TimingConstants.activationConfirmTimeoutUs)
+    }
+
+    public static var overlayClearTimeoutUs: UInt32 {
+        readUInt32("overlayClearTimeoutUs", default: TimingConstants.overlayClearTimeoutUs)
+    }
+
+    public static var spotlightAppearanceUs: UInt32 {
+        readUInt32("spotlightAppearanceUs", default: TimingConstants.spotlightAppearanceUs)
+    }
+
+    public static var searchResultsPopulateUs: UInt32 {
+        readUInt32("searchResultsPopulateUs", default: TimingConstants.searchResultsPopulateUs)
+    }
+
+    public static var launchVerifySettleUs: UInt32 {
+        readUInt32("launchVerifySettleUs", default: TimingConstants.launchVerifySettleUs)
+    }
+
+    public static var safariLoadUs: UInt32 {
+        readUInt32("safariLoadUs", default: TimingConstants.safariLoadUs)
+    }
+
+    public static var addressBarActivateUs: UInt32 {
+        readUInt32("addressBarActivateUs", default: TimingConstants.addressBarActivateUs)
+    }
+
+    public static var preReturnUs: UInt32 {
+        readUInt32("preReturnUs", default: TimingConstants.preReturnUs)
+    }
+
+    // MARK: - Process & System Polling
+
+    public static var processPollUs: UInt32 {
+        readUInt32("processPollUs", default: TimingConstants.processPollUs)
+    }
+
+    public static var earlyFailureDetectUs: UInt32 {
+        readUInt32("earlyFailureDetectUs", default: TimingConstants.earlyFailureDetectUs)
+    }
+
+    public static var resumeFromPausedUs: UInt32 {
+        readUInt32("resumeFromPausedUs", default: TimingConstants.resumeFromPausedUs)
+    }
+
+    public static var launchConnectTimeoutUs: UInt32 {
+        readUInt32("launchConnectTimeoutUs", default: TimingConstants.launchConnectTimeoutUs)
+    }
+
+    public static var launchConnectPollUs: UInt32 {
+        readUInt32("launchConnectPollUs", default: TimingConstants.launchConnectPollUs)
+    }
+
+    public static var postHeartbeatSettleUs: UInt32 {
+        readUInt32("postHeartbeatSettleUs", default: TimingConstants.postHeartbeatSettleUs)
+    }
+
+    // MARK: - Listen
+
+    public static var listenSilencePeak: Double {
+        readDouble("listenSilencePeak", default: TimingConstants.listenSilencePeak)
+    }
+
+    public static var listenSilentStartSeconds: Double {
+        readDouble("listenSilentStartSeconds", default: TimingConstants.listenSilentStartSeconds)
+    }
+
+    public static var listenTrailingSilenceSeconds: Double {
+        readDouble("listenTrailingSilenceSeconds", default: TimingConstants.listenTrailingSilenceSeconds)
+    }
+
+    // MARK: - CGEvent Keyboard
+
+    public static var deadKeyDelayUs: UInt32 {
+        readUInt32("deadKeyDelayUs", default: TimingConstants.deadKeyDelayUs)
+    }
+
+    // MARK: - Non-Timing Constants
+
+    public static var dragInterpolationSteps: Int {
+        readInt("dragInterpolationSteps", default: TimingConstants.dragInterpolationSteps)
+    }
+
+    public static var swipeInterpolationSteps: Int {
+        readInt("swipeInterpolationSteps", default: TimingConstants.swipeInterpolationSteps)
+    }
+
+    public static var scrollPixelScale: Double {
+        readDouble("scrollPixelScale", default: TimingConstants.scrollPixelScale)
+    }
+
+    // MARK: - Content Bounds Detection
+
+    public static var brightnessThreshold: UInt8 {
+        if let value = settings["brightnessThreshold"],
+           let num = value as? Int, num >= 0, num <= 255 {
+            return UInt8(num)
+        }
+        if let str = env[envVarName("brightnessThreshold")],
+           let num = Int(str), num >= 0, num <= 255 {
+            return UInt8(num)
+        }
+        return TimingConstants.brightnessThreshold
+    }
+
+    // MARK: - Tap Point Calculation
+
+    public static var tapMaxLabelLength: Int {
+        readInt("tapMaxLabelLength", default: TimingConstants.tapMaxLabelLength)
+    }
+
+    public static var tapMaxLabelWidthFraction: Double {
+        readDouble("tapMaxLabelWidthFraction", default: TimingConstants.tapMaxLabelWidthFraction)
+    }
+
+    public static var tapMinGapForOffset: Double {
+        readDouble("tapMinGapForOffset", default: TimingConstants.tapMinGapForOffset)
+    }
+
+    public static var tapIconRowMinLabels: Int {
+        readInt("tapIconRowMinLabels", default: TimingConstants.tapIconRowMinLabels)
+    }
+
+    public static var tapIconOffset: Double {
+        readDouble("tapIconOffset", default: TimingConstants.tapIconOffset)
+    }
+
+    public static var tapRowTolerance: Double {
+        readDouble("tapRowTolerance", default: TimingConstants.tapRowTolerance)
+    }
+
+    public static var tapBottomZoneFraction: Double {
+        readDouble("tapBottomZoneFraction", default: TimingConstants.tapBottomZoneFraction)
+    }
+
+    public static var tapIconRowMaxSpacingRatio: Double {
+        readDouble("tapIconRowMaxSpacingRatio", default: TimingConstants.tapIconRowMaxSpacingRatio)
+    }
+
+
+    // MARK: - Grid Overlay
+
+    public static var gridSpacing: Double {
+        readDouble("gridSpacing", default: TimingConstants.gridSpacing)
+    }
+
+    public static var gridLineAlpha: Double {
+        readDouble("gridLineAlpha", default: TimingConstants.gridLineAlpha)
+    }
+
+    public static var gridLabelFontSize: Double {
+        readDouble("gridLabelFontSize", default: TimingConstants.gridLabelFontSize)
+    }
+
+    public static var gridLabelEveryN: Int {
+        readInt("gridLabelEveryN", default: TimingConstants.gridLabelEveryN)
+    }
+
+    // MARK: - Event Classification
+
+    public static var eventTapDistanceThreshold: Double {
+        readDouble("eventTapDistanceThreshold", default: TimingConstants.eventTapDistanceThreshold)
+    }
+
+    public static var eventSwipeDistanceThreshold: Double {
+        readDouble("eventSwipeDistanceThreshold", default: TimingConstants.eventSwipeDistanceThreshold)
+    }
+
+    public static var eventLongPressThreshold: Double {
+        readDouble("eventLongPressThreshold", default: TimingConstants.eventLongPressThreshold)
+    }
+
+    public static var eventLabelMaxDistance: Double {
+        readDouble("eventLabelMaxDistance", default: TimingConstants.eventLabelMaxDistance)
+    }
+
+    // MARK: - Internal Helpers (used by extension in EnvConfigFeatures.swift)
+
+    static let env = ProcessInfo.processInfo.environment
+
+    /// Convert camelCase key to MIRROIR_SCREAMING_SNAKE_CASE for env var lookup.
+    static func envVarName(_ key: String) -> String {
+        var result = "MIRROIR_"
+        for char in key {
+            if char.isUppercase {
+                result += "_"
+            }
+            result += String(char).uppercased()
+        }
+        return result
+    }
+
+    /// Read `key` from `settings`, then from its `MIRROIR_*` variable in `env`, else
+    /// `fallback`. `settings` and `env` default to the process-wide sources.
+    static func readString(_ key: String, envVar: String? = nil,
+                            default fallback: String,
+                            settings: [String: Any] = EnvConfig.settings,
+                            env: [String: String] = EnvConfig.env) -> String {
+        if let val = settings[key] as? String { return val }
+        if let val = env[envVar ?? envVarName(key)] { return val }
+        return fallback
+    }
+
+    static func readUInt32(_ key: String, default fallback: UInt32,
+                            settings: [String: Any] = EnvConfig.settings,
+                            env: [String: String] = EnvConfig.env) -> UInt32 {
+        if let value = settings[key] {
+            if let intVal = value as? Int, intVal >= 0 { return UInt32(clamping: intVal) }
+            if let doubleVal = value as? Double, doubleVal >= 0,
+               let parsed = UInt32(exactly: Swift.min(doubleVal, Double(UInt32.max)).rounded(.towardZero)) {
+                return parsed
+            }
+        }
+        if let str = env[envVarName(key)], let parsed = UInt32(str) { return parsed }
+        return fallback
+    }
+
+    static func readInt(_ key: String, default fallback: Int,
+                            settings: [String: Any] = EnvConfig.settings,
+                            env: [String: String] = EnvConfig.env) -> Int {
+        if let value = settings[key] {
+            if let intVal = value as? Int { return intVal }
+            if let doubleVal = value as? Double,
+               let parsed = Int(exactly: doubleVal.rounded(.towardZero)) {
+                return parsed
+            }
+        }
+        if let str = env[envVarName(key)], let parsed = Int(str) { return parsed }
+        return fallback
+    }
+
+    static func readBool(_ key: String, envVar: String? = nil,
+                          default fallback: Bool) -> Bool {
+        if let value = settings[key] as? Bool { return value }
+        // JSON numbers: 0 = false, non-zero = true
+        if let value = settings[key] as? Int { return value != 0 }
+        if let str = env[envVar ?? envVarName(key)] {
+            return isTrue(str)
+        }
+        return fallback
+    }
+
+    /// Whether an environment value reads as on: `true`, `1` or `yes`, in any
+    /// case. Anything else, an unsubstituted `${...}` placeholder included, is off.
+    public static func isTrue(_ value: String) -> Bool {
+        ["true", "1", "yes"].contains(value.lowercased())
+    }
+
+    static func readDouble(_ key: String, default fallback: Double) -> Double {
+        if let value = settings[key] {
+            if let doubleVal = value as? Double { return doubleVal }
+            if let intVal = value as? Int { return Double(intVal) }
+        }
+        if let str = env[envVarName(key)], let parsed = Double(str) { return parsed }
+        return fallback
+    }
+
+    /// Reads a string array from settings.json (JSON array) or an env var
+    /// (comma-separated, e.g. "ja-JP,en-US"). Returns `nil` when the key is
+    /// absent from both, so the caller decides what an unset value means.
+    static func readOptionalStringArray(_ key: String, envVar: String? = nil) -> [String]? {
+        if let arr = settings[key] as? [String], !arr.isEmpty { return arr }
+        let varName = envVar ?? envVarName(key)
+        if let str = env[varName], !str.isEmpty {
+            return str.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
+        }
+        return nil
+    }
+}

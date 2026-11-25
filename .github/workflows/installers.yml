@@ -1,0 +1,372 @@
+name: Installers
+
+on:
+  push:
+    # Every branch, not just main: this repo squash-merges locally and opens no
+    # pull requests of its own, so a feature branch has no other way to reach
+    # this lane before it lands. `branches-ignore` rather than deleting the key —
+    # a push trigger that names `tags` and omits `branches` fires ONLY on tags,
+    # which would disable branch CI outright. Dependabot is excluded because it
+    # pushes its branch AND opens a PR, and the two land in different
+    # concurrency groups, so the push run is a pure duplicate of the PR run.
+    branches-ignore: ['dependabot/**']
+    # The old 'feature/**' glob could not match the branch names actually used
+    # here (feat/..., fix/...), so non-main pushes were effectively unbuilt.
+    tags: ['v*']
+    # No `paths` here: one paths filter applies to every ref the trigger
+    # covers. Release tags always run every installer, and main does unless a
+    # push changed only documentation. A
+    # feature-branch push runs them only when an installer input changed —
+    # the `changes` job below names those inputs; Sources/ and Tests/ on a
+    # branch are build.yml's to cover. workflow_dispatch forces a full run.
+  pull_request:
+    branches: [main]
+    paths:
+      - 'Package.swift'
+      - 'Sources/**'
+      - 'Tests/**'
+      - 'Resources/**'
+      - 'mirroir.sh'
+      - 'npm/**'
+      - 'scripts/package-fake-app.sh'
+      - '.github/actions/setup-embacle/**'
+      - '.github/actions/setup-fake-mirroring/**'
+      - '.github/workflows/installers.yml'
+  workflow_dispatch:
+
+# Cancel superseded runs on the same branch / PR — three macos-15 jobs run here,
+# so a superseded run is expensive to leave in flight. Never on main or a tag:
+# each of those commits keeps its own complete run.
+concurrency:
+  # On main every commit keeps its own run: a third push must not replace a queued second one.
+  group: installers-${{ github.head_ref || github.ref }}${{ github.ref == 'refs/heads/main' && format('-{0}', github.sha) || '' }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' && !startsWith(github.ref, 'refs/tags/') }}
+
+jobs:
+  # What the three installers exercise beyond the Swift sources: mirroir.sh
+  # and the agents/ profiles it copies, the npm wrapper, the manifest every
+  # install builds from, and the embacle/FakeMirroring setup they share. The
+  # Homebrew formula is written inline below, so this file covers it.
+  changes:
+    name: Installer inputs changed
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      run: ${{ steps.gate.outputs.run }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          filter: blob:none
+      - name: Test the gate
+        run: bash scripts/ci/changed-paths-test.sh
+      - id: gate
+        env:
+          PUSH_BEFORE: ${{ github.event.before }}
+        run: >-
+          bash scripts/ci/changed-paths.sh
+          'mirroir.sh' 'agents/*' 'npm/*' 'Package.swift' 'Package.resolved'
+          'scripts/package-fake-app.sh' 'scripts/ci/changed-paths.sh' 'scripts/ci/changed-paths-test.sh'
+          '.github/actions/setup-embacle/*' '.github/actions/setup-fake-mirroring/*'
+          '.github/workflows/installers.yml'
+
+  source-install:
+    name: Source install (mirroir.sh)
+    needs: changes
+    if: needs.changes.outputs.run == 'true'
+    runs-on: macos-15
+    permissions:
+      contents: read
+    env:
+      MIRROIR_BUNDLE_ID: com.jfarcand.FakeMirroring
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: ./.github/actions/setup-embacle
+
+      - name: Clone skills repo
+        run: |
+          git clone https://github.com/jfarcand/mirroir-skills.git ../mirroir-skills
+          mkdir -p .mirroir-mcp
+          ln -s "$(cd ../mirroir-skills && pwd)" .mirroir-mcp/skills
+
+      - name: Run mirroir.sh
+        run: ./mirroir.sh
+
+      - name: Verify binaries built
+        run: |
+          test -x .build/release/mirroir-mcp
+          # Verify mirroir CLI symlink was created (Homebrew bin dir)
+          test -L /opt/homebrew/bin/mirroir || test -L /usr/local/bin/mirroir
+          mirroir record --help 2>&1 | grep -q "Record a walk on iPhone Mirroring"
+
+      - name: Verify embacle FFI linked
+        run: nm .build/release/mirroir-mcp | grep -q embacle_init
+
+      - uses: ./.github/actions/setup-fake-mirroring
+      - name: Integration tests (FakeMirroring)
+        run: swift test --filter IntegrationTests
+
+      - name: MCP initialize (installed binary)
+        run: |
+          echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
+            | .build/release/mirroir-mcp 2>/dev/null \
+            | python3 -c "
+          import sys, json
+          obj = json.loads(sys.stdin.readline())
+          assert obj['result']['serverInfo']['name'] == 'mirroir-mcp'
+          print('MCP initialize: OK')
+          "
+
+      - name: MCP tools/call screenshot (installed binary + FakeMirroring)
+        run: |
+          printf '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}\n{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"screenshot","arguments":{}}}\n' \
+            | .build/release/mirroir-mcp --dangerously-skip-permissions 2>/dev/null \
+            | python3 -c "
+          import sys, json
+          lines = sys.stdin.readlines()
+          resp = json.loads(lines[1])
+          content = resp['result']['content']
+          images = [c for c in content if c.get('type') == 'image']
+          assert len(images) > 0, f'Expected image in screenshot response, got: {content}'
+          print(f'screenshot tool: OK ({len(images)} image block(s))')
+          "
+
+      - name: Update knows this is a source install
+        run: |
+          .build/release/mirroir-mcp update --dry-run 2>&1 | tee update.txt
+          grep -q "Installed from the source checkout" update.txt
+
+      - name: CLI refuses what it does not know, and piped output is plain
+        run: |
+          set +e
+          .build/release/mirroir-mcp bogus </dev/null; [ $? -eq 2 ] || { echo "an unknown command must exit 2"; exit 1; }
+          .build/release/mirroir-mcp update --dryrun; [ $? -eq 2 ] || { echo "a mistyped option must exit 2"; exit 1; }
+          .build/release/mirroir-mcp --version | grep -q '^mirroir-mcp [0-9]' || { echo "no version line"; exit 1; }
+          .build/release/mirroir-mcp doctor 2>doctor-plain.txt
+          if grep -q "$(printf '\033')" doctor-plain.txt; then echo "piped doctor output carries an escape code"; exit 1; fi
+
+      - name: Doctor reads the screen end to end (installed binary + FakeMirroring)
+        run: |
+          .build/release/mirroir-mcp doctor --json 2>doctor.json || true
+          python3 -c "
+          import json
+          raw = open('doctor.json').read()
+          report, _ = json.JSONDecoder().raw_decode(raw[raw.index('{'):])
+          checks = {c['name']: c for c in report['checks']}
+          read = checks.get('Screen read')
+          assert read, f'doctor ran no screen read: {checks}'
+          assert read['status'] == 'passed', f'screen read: {read}'
+          print('doctor screen read:', read['detail'])
+          "
+
+  homebrew-install:
+    name: Homebrew install (local formula)
+    needs: changes
+    if: needs.changes.outputs.run == 'true'
+    runs-on: macos-15
+    permissions:
+      contents: read
+    env:
+      MIRROIR_BUNDLE_ID: com.jfarcand.FakeMirroring
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: ./.github/actions/setup-embacle
+
+      - name: Clone skills repo
+        run: |
+          git clone https://github.com/jfarcand/mirroir-skills.git ../mirroir-skills
+          mkdir -p .mirroir-mcp
+          ln -s "$(cd ../mirroir-skills && pwd)" .mirroir-mcp/skills
+
+      - name: Create source tarball
+        run: |
+          TAR_PATH="/tmp/mirroir-mcp-local.tar.gz"
+          git archive --format=tar.gz --prefix=mirroir-mcp-local/ HEAD > "$TAR_PATH"
+          SHA=$(shasum -a 256 "$TAR_PATH" | cut -d' ' -f1)
+          echo "TARBALL_PATH=$TAR_PATH" >> $GITHUB_ENV
+          echo "TARBALL_SHA=$SHA" >> $GITHUB_ENV
+
+      - name: Create local tap with formula
+        run: |
+          brew tap-new local/test
+          TAP_DIR="$(brew --repository)/Library/Taps/local/homebrew-test/Formula"
+          mkdir -p "$TAP_DIR"
+          cat > "$TAP_DIR/mirroir-mcp.rb" << RUBY
+          class MirroirMcp < Formula
+            desc "MCP server for controlling iPhone through macOS iPhone Mirroring"
+            homepage "https://github.com/OllieKnight31/mirroir-mcp"
+            url "file://${TARBALL_PATH}"
+            version "0.0.0-ci"
+            sha256 "${TARBALL_SHA}"
+            license "Apache-2.0"
+
+            depends_on :macos
+            depends_on xcode: ["15.0", :build]
+            depends_on "dravr-ai/tap/embacle-ffi"
+
+            def install
+              embacle_lib = Formula["embacle-ffi"].opt_lib
+              system "swift", "build", "-c", "release", "--disable-sandbox",
+                "-Xlinker", "-L#{embacle_lib}"
+              bin.install ".build/release/mirroir-mcp"
+              bin.install_symlink "mirroir-mcp" => "mirroir"
+            end
+
+            test do
+              assert_match "mirroir-mcp", shell_output("#{bin}/mirroir-mcp --help 2>&1", 1)
+            end
+          end
+          RUBY
+
+      - name: Install from local tap
+        run: brew install local/test/mirroir-mcp
+
+      - name: Verify Homebrew-installed binaries
+        run: |
+          which mirroir-mcp
+          which mirroir
+          # Verify mirroir CLI works (symlink to mirroir-mcp)
+          mirroir test --help 2>&1 | grep -q "mirroir-mcp test"
+
+      - name: Update knows this is a Homebrew install
+        run: |
+          mirroir-mcp update --dry-run 2>&1 | tee update.txt
+          grep -q "Would run: brew upgrade mirroir-mcp" update.txt
+
+      - name: Verify embacle FFI linked
+        run: nm "$(brew --prefix)/bin/mirroir-mcp" | grep -q embacle_init
+
+      - uses: ./.github/actions/setup-fake-mirroring
+      - name: Integration tests (FakeMirroring)
+        run: swift test --filter IntegrationTests
+
+      - name: MCP initialize (brew-installed binary)
+        run: |
+          echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
+            | mirroir-mcp 2>/dev/null \
+            | python3 -c "
+          import sys, json
+          obj = json.loads(sys.stdin.readline())
+          assert obj['result']['serverInfo']['name'] == 'mirroir-mcp'
+          print('MCP initialize (brew path): OK')
+          "
+
+      - name: MCP tools/call screenshot (brew-installed binary + FakeMirroring)
+        run: |
+          printf '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}\n{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"screenshot","arguments":{}}}\n' \
+            | mirroir-mcp --dangerously-skip-permissions 2>/dev/null \
+            | python3 -c "
+          import sys, json
+          lines = sys.stdin.readlines()
+          resp = json.loads(lines[1])
+          content = resp['result']['content']
+          images = [c for c in content if c.get('type') == 'image']
+          assert len(images) > 0, f'Expected image in screenshot response, got: {content}'
+          print(f'screenshot tool: OK ({len(images)} image block(s))')
+          "
+
+      - name: Cleanup
+        if: always()
+        run: |
+          sudo brew uninstall mirroir-mcp || true
+
+  npx-install:
+    name: NPX install (npm package)
+    needs: changes
+    if: needs.changes.outputs.run == 'true'
+    runs-on: macos-15
+    permissions:
+      contents: read
+    env:
+      MIRROIR_BUNDLE_ID: com.jfarcand.FakeMirroring
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: ./.github/actions/setup-embacle
+
+      - name: Clone skills repo
+        run: |
+          git clone https://github.com/jfarcand/mirroir-skills.git ../mirroir-skills
+          mkdir -p .mirroir-mcp
+          ln -s "$(cd ../mirroir-skills && pwd)" .mirroir-mcp/skills
+
+      - name: Build release binaries
+        run: swift build -c release
+
+      - name: Verify embacle FFI linked
+        run: nm .build/release/mirroir-mcp | grep -q embacle_init
+
+      - name: Stage binaries into npm/bin/ (simulates install.js postinstall)
+        run: |
+          mkdir -p npm/bin
+          cp .build/release/mirroir-mcp npm/bin/mirroir-mcp-native
+          chmod +x npm/bin/mirroir-mcp-native
+
+      - uses: ./.github/actions/setup-fake-mirroring
+      - name: Integration tests (FakeMirroring)
+        run: swift test --filter IntegrationTests
+
+      - name: MCP initialize (npx wrapper)
+        run: |
+          echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
+            | node npm/bin/mirroir-mcp 2>/dev/null \
+            | python3 -c "
+          import sys, json
+          obj = json.loads(sys.stdin.readline())
+          assert obj['result']['serverInfo']['name'] == 'mirroir-mcp'
+          assert 'describe_screen' in obj['result']['instructions'], 'initialize must carry the operating manual'
+          print('MCP initialize (npx wrapper): OK')
+          "
+
+      # npm 12 skips postinstall unless allowed, so the wrapper must fetch the
+      # binary on first run. The real install.js downloads the release asset,
+      # which does not exist yet on a version-bump commit: a stand-in installer
+      # copies the binary just built and prints to stdout, as install.js does.
+      - name: First run without postinstall fetches the binary, stdout stays MCP-only
+        run: |
+          PKG="$RUNNER_TEMP/npx-no-postinstall"
+          mkdir -p "$PKG/bin"
+          cp npm/bin/mirroir-mcp "$PKG/bin/mirroir-mcp"
+          cat > "$PKG/install.js" <<EOF
+          const fs = require("fs");
+          console.log("stand-in installer ran");
+          fs.copyFileSync("$GITHUB_WORKSPACE/.build/release/mirroir-mcp", __dirname + "/bin/mirroir-mcp-native");
+          fs.chmodSync(__dirname + "/bin/mirroir-mcp-native", 0o755);
+          EOF
+          echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
+            | node "$PKG/bin/mirroir-mcp" 2> "$RUNNER_TEMP/first-run.err" > "$RUNNER_TEMP/first-run.out"
+          grep -q "stand-in installer ran" "$RUNNER_TEMP/first-run.err" \
+            || { echo "the installer did not run, or wrote to stdout"; cat "$RUNNER_TEMP/first-run.out"; exit 1; }
+          python3 -c "
+          import json
+          lines = open('$RUNNER_TEMP/first-run.out').read().splitlines()
+          assert len(lines) == 1, f'stdout must hold only the MCP reply, got {lines}'
+          assert json.loads(lines[0])['result']['serverInfo']['name'] == 'mirroir-mcp'
+          print('First run without postinstall: OK')
+          "
+
+      - name: Agent skill installs for Claude Code and Codex (clean HOME)
+        run: |
+          CLEAN_HOME=$(mktemp -d)
+          HOME="$CLEAN_HOME" node npm/bin/mirroir-mcp skill --install
+          for f in "$CLEAN_HOME/.claude/skills/mirroir/SKILL.md" "$CLEAN_HOME/.codex/skills/mirroir/SKILL.md"; do
+            head -2 "$f" | grep -qx 'name: mirroir' || { echo "missing or malformed: $f"; exit 1; }
+          done
+          echo "Agent skill installed: OK"
+
+      - name: MCP tools/call screenshot (npx wrapper + FakeMirroring)
+        run: |
+          printf '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}\n{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"screenshot","arguments":{}}}\n' \
+            | node npm/bin/mirroir-mcp --dangerously-skip-permissions 2>/dev/null \
+            | python3 -c "
+          import sys, json
+          lines = sys.stdin.readlines()
+          resp = json.loads(lines[1])
+          content = resp['result']['content']
+          images = [c for c in content if c.get('type') == 'image']
+          assert len(images) > 0, f'Expected image in screenshot response, got: {content}'
+          print(f'screenshot tool: OK ({len(images)} image block(s))')
+          "

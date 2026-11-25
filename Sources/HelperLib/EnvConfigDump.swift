@@ -1,0 +1,242 @@
+/*
+ * Copyright 2026 Async-IO.org
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License"); you may not
+ * use this file except in compliance with the License. You may obtain a copy of
+ * the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ */
+// ABOUTME: Formatted dump of all effective EnvConfig values, grouped by section.
+// ABOUTME: Used at startup to log the active configuration for debugging.
+
+import Foundation
+
+extension EnvConfig {
+
+    /// Returns a formatted two-column dump of all effective configuration values,
+    /// grouped by section. Suitable for startup logging.
+    public static func formattedConfigDump() -> String {
+        let sections: [(String, [(String, String)])] = [
+            ("Cursor & Input", [
+                ("cursorSettleUs", "\(cursorSettleUs)"),
+                ("clickHoldUs", "\(clickHoldUs)"),
+                ("doubleTapHoldUs", "\(doubleTapHoldUs)"),
+                ("doubleTapGapUs", "\(doubleTapGapUs)"),
+                ("dragModeHoldUs", "\(dragModeHoldUs)"),
+                ("focusSettleUs", "\(focusSettleUs)"),
+                ("keystrokeDelayUs", "\(keystrokeDelayUs)"),
+                ("pasteboardSyncUs", "\(pasteboardSyncUs)"),
+                ("pasteVerifyTimeoutUs", "\(pasteVerifyTimeoutUs)"),
+                ("pasteVerifyPollUs", "\(pasteVerifyPollUs)"),
+                ("pasteVerifyWindowChars", "\(pasteVerifyWindowChars)"),
+            ]),
+            ("App Switching", [
+                ("statusBarTapY", "\(statusBarTapY)"),
+                ("spaceSwitchSettleUs", "\(spaceSwitchSettleUs)"),
+                ("windowGeometryRecheckUs", "\(windowGeometryRecheckUs)"),
+                ("activationConfirmTimeoutUs", "\(activationConfirmTimeoutUs)"),
+                ("overlayClearTimeoutUs", "\(overlayClearTimeoutUs)"),
+                ("spotlightAppearanceUs", "\(spotlightAppearanceUs)"),
+                ("searchResultsPopulateUs", "\(searchResultsPopulateUs)"),
+                ("launchVerifySettleUs", "\(launchVerifySettleUs)"),
+                ("safariLoadUs", "\(safariLoadUs)"),
+                ("addressBarActivateUs", "\(addressBarActivateUs)"),
+                ("preReturnUs", "\(preReturnUs)"),
+            ]),
+            ("Process & Polling", [
+                ("processPollUs", "\(processPollUs)"),
+                ("earlyFailureDetectUs", "\(earlyFailureDetectUs)"),
+                ("resumeFromPausedUs", "\(resumeFromPausedUs)"),
+                ("launchConnectTimeoutUs", "\(launchConnectTimeoutUs)"),
+                ("launchConnectPollUs", "\(launchConnectPollUs)"),
+                ("postHeartbeatSettleUs", "\(postHeartbeatSettleUs)"),
+            ]),
+            ("Server Process", [
+                ("debugLogging", "\(debugLogging)"),
+                ("debugLogMaxBytes", "\(debugLogMaxBytes)"),
+                ("keepDisplayAwake", "\(keepDisplayAwake)"),
+                ("windowInput", windowInput),
+                ("grantPollUs", "\(grantPollUs)"),
+                ("grantWaitUs", "\(grantWaitUs)"),
+            ]),
+            ("Listen", [
+                ("listenSilencePeak", "\(listenSilencePeak)"),
+                ("listenSilentStartSeconds", "\(listenSilentStartSeconds)"),
+                ("listenTrailingSilenceSeconds", "\(listenTrailingSilenceSeconds)"),
+            ]),
+            ("Keyboard", [
+                ("deadKeyDelayUs", "\(deadKeyDelayUs)"),
+                ("keyboardLayout", keyboardLayouts.joined(separator: ", ")),
+            ]),
+            ("Drag & Swipe", [
+                ("dragInterpolationSteps", "\(dragInterpolationSteps)"),
+                ("swipeInterpolationSteps", "\(swipeInterpolationSteps)"),
+                ("scrollPixelScale", "\(scrollPixelScale)"),
+                ("swipeDistanceFraction", "\(swipeDistanceFraction)"),
+                ("scrollSwipeFromYFraction", "\(scrollSwipeFromYFraction)"),
+                ("scrollSwipeToYFraction", "\(scrollSwipeToYFraction)"),
+                ("defaultSwipeDurationMs", "\(defaultSwipeDurationMs)"),
+                ("defaultDragDurationMs", "\(defaultDragDurationMs)"),
+                ("defaultLongPressDurationMs", "\(defaultLongPressDurationMs)"),
+                ("defaultScrollMaxAttempts", "\(defaultScrollMaxAttempts)"),
+                ("scrollEndConfirmations", "\(scrollEndConfirmations)"),
+                ("scrollUnchangedTextShare", "\(scrollUnchangedTextShare)"),
+                ("scrollRevisitDepth", "\(scrollRevisitDepth)"),
+                ("scrollUnchangedPositionTolerance", "\(scrollUnchangedPositionTolerance)"),
+                ("axTreeMaxNodes", "\(axTreeMaxNodes)"),
+                ("axTreeMessagingTimeoutMs", "\(axTreeMessagingTimeoutMs)"),
+            ]),
+            ("OCR", [
+                ("ocrBackend", ocrBackend),
+                ("ocrRecognitionLevel", ocrRecognitionLevel),
+                ("ocrLanguageCorrection", "\(ocrLanguageCorrection)"),
+            ]),
+            ("YOLO", [
+                ("yoloModelURL", yoloModelURL.isEmpty ? "(none)" : yoloModelURL),
+                ("yoloModelPath", yoloModelPath.isEmpty ? "(none)" : yoloModelPath),
+                ("yoloConfidenceThreshold", "\(yoloConfidenceThreshold)"),
+            ]),
+            ("Scroll Dedup", [
+                ("scrollDedupStrategy", scrollDedupStrategy),
+                ("scrollDedupLevenshteinMax", "\(scrollDedupLevenshteinMax)"),
+                ("scrollDedupProximityPt", "\(scrollDedupProximityPt)"),
+                ("scrollAnchorMinCount", "\(scrollAnchorMinCount)"),
+            ]),
+            ("Content Bounds", [
+                ("brightnessThreshold", "\(brightnessThreshold)"),
+            ]),
+            ("Tap Point", [
+                ("tapMaxLabelLength", "\(tapMaxLabelLength)"),
+                ("tapMaxLabelWidthFraction", "\(tapMaxLabelWidthFraction)"),
+                ("tapMinGapForOffset", "\(tapMinGapForOffset)"),
+                ("tapIconRowMinLabels", "\(tapIconRowMinLabels)"),
+                ("tapIconOffset", "\(tapIconOffset)"),
+                ("tapRowTolerance", "\(tapRowTolerance)"),
+                ("tapBottomZoneFraction", "\(tapBottomZoneFraction)"),
+            ]),
+            ("Safe Area", [
+                ("safeBottomMarginPt", "\(TimingConstants.safeBottomMarginPt)"),
+            ]),
+            ("Grid Overlay", [
+                ("gridSpacing", "\(gridSpacing)"),
+                ("gridLineAlpha", "\(gridLineAlpha)"),
+                ("gridLabelFontSize", "\(gridLabelFontSize)"),
+                ("gridLabelEveryN", "\(gridLabelEveryN)"),
+            ]),
+            ("Event Classification", [
+                ("eventTapDistanceThreshold", "\(eventTapDistanceThreshold)"),
+                ("eventSwipeDistanceThreshold", "\(eventSwipeDistanceThreshold)"),
+                ("eventLongPressThreshold", "\(eventLongPressThreshold)"),
+                ("eventLabelMaxDistance", "\(eventLabelMaxDistance)"),
+            ]),
+            ("Step Execution", [
+                ("waitForTimeoutSeconds", "\(waitForTimeoutSeconds)"),
+                ("stepSettlingDelayMs", "\(stepSettlingDelayMs)"),
+                ("compiledSleepBufferMs", "\(compiledSleepBufferMs)"),
+                ("waitForPollIntervalUs", "\(waitForPollIntervalUs)"),
+                ("measurePollIntervalUs", "\(measurePollIntervalUs)"),
+                ("defaultMeasureTimeoutSeconds", "\(defaultMeasureTimeoutSeconds)"),
+                ("settingsLoadUs", "\(settingsLoadUs)"),
+            ]),
+            ("App Switcher", [
+                ("appSwitcherCardYFraction", "\(appSwitcherCardYFraction)"),
+                ("appSwitcherSwipeDistance", "\(appSwitcherSwipeDistance)"),
+                ("appSwitcherSwipeDurationMs", "\(appSwitcherSwipeDurationMs)"),
+                ("appSwitcherMaxSwipes", "\(appSwitcherMaxSwipes)"),
+                ("toolSettlingDelayUs", "\(toolSettlingDelayUs)"),
+                ("networkChangeTimeoutUs", "\(networkChangeTimeoutUs)"),
+            ]),
+            ("Icon Detection", [
+                ("iconOcrProximityFilter", "\(iconOcrProximityFilter)"),
+                ("iconMinZoneHeight", "\(iconMinZoneHeight)"),
+                ("iconSaliencyMinZone", "\(iconSaliencyMinZone)"),
+                ("iconBottomZoneFraction", "\(iconBottomZoneFraction)"),
+                ("iconTopZoneFraction", "\(iconTopZoneFraction)"),
+                ("iconMaxZoneElements", "\(iconMaxZoneElements)"),
+                ("iconNoiseMaxLength", "\(iconNoiseMaxLength)"),
+                ("iconMaxSaliencySize", "\(iconMaxSaliencySize)"),
+                ("iconMinForInterpolation", "\(iconMinForInterpolation)"),
+                ("iconSpacingTolerance", "\(iconSpacingTolerance)"),
+                ("iconDeduplicationRadius", "\(iconDeduplicationRadius)"),
+            ]),
+            ("Icon Clusters", [
+                ("iconColorThreshold", "\(iconColorThreshold)"),
+                ("iconMinColumnDensity", "\(iconMinColumnDensity)"),
+                ("iconMinClusterWidth", "\(iconMinClusterWidth)"),
+                ("iconMaxClusterWidth", "\(iconMaxClusterWidth)"),
+                ("iconSmoothingWindow", "\(iconSmoothingWindow)"),
+                ("iconCornerInsetPixels", "\(iconCornerInsetPixels)"),
+                ("iconBarRowBgFraction", "\(iconBarRowBgFraction)"),
+            ]),
+            ("AI Provider", [
+                ("openAITimeoutSeconds", "\(openAITimeoutSeconds)"),
+                ("ollamaTimeoutSeconds", "\(ollamaTimeoutSeconds)"),
+                ("anthropicTimeoutSeconds", "\(anthropicTimeoutSeconds)"),
+                ("embacleTimeoutSeconds", "\(embacleTimeoutSeconds)"),
+                ("commandTimeoutSeconds", "\(commandTimeoutSeconds)"),
+                ("defaultAIMaxTokens", "\(defaultAIMaxTokens)"),
+                ("anthropicMaxTokens", "\(anthropicMaxTokens)"),
+                ("anthropicEffort", anthropicEffort.rawValue),
+            ]),
+            ("Exploration", [
+                ("explorationMaxDepth", "\(explorationMaxDepth)"),
+                ("explorationMaxScreens", "\(explorationMaxScreens)"),
+                ("explorationMaxTimeSeconds", "\(explorationMaxTimeSeconds)"),
+            ]),
+            ("Screen Describer", [
+                ("screenDescriberMode", screenDescriberMode),
+                ("visionImageWidth", "\(visionImageWidth)"),
+                ("visionMaxTokens", "\(visionMaxTokens)"),
+                ("agent", agent.isEmpty ? "(none)" : agent),
+                ("sceneAgent", sceneAgent),
+                ("sceneCellTapGapMs", "\(sceneCellTapGapMs)"),
+                ("agentTransport", agentTransport),
+            ]),
+            ("Compiled Safety", [
+                ("compiledTapPositionTolerance", "\(compiledTapPositionTolerance)"),
+                ("compiledTapArrivalMinTexts", "\(compiledTapArrivalMinTexts)"),
+            ]),
+            ("Component Detection", [
+                ("componentDetection", componentDetection),
+            ]),
+            ("App Identity", [
+                ("mirroringBundleID", mirroringBundleID),
+                ("notificationCenterBundleID", notificationCenterBundleID),
+            ]),
+        ]
+
+        var lines = [String]()
+        let keyWidth = 30
+        let columnWidth = 60
+
+        for (section, entries) in sections {
+            lines.append("  [\(section)]")
+            // Lay out entries in two columns
+            var i = 0
+            while i < entries.count {
+                let (k1, v1) = entries[i]
+                let left = "    \(k1.padding(toLength: keyWidth, withPad: " ", startingAt: 0)) \(v1)"
+                if i + 1 < entries.count {
+                    let (k2, v2) = entries[i + 1]
+                    // Pad with spaces; never truncate long values
+                    let gap = max(columnWidth - left.count, 2)
+                    let padding = String(repeating: " ", count: gap)
+                    lines.append("\(left)\(padding)\(k2.padding(toLength: keyWidth, withPad: " ", startingAt: 0)) \(v2)")
+                    i += 2
+                } else {
+                    lines.append(left)
+                    i += 1
+                }
+            }
+        }
+
+        return lines.joined(separator: "\n")
+    }
+}

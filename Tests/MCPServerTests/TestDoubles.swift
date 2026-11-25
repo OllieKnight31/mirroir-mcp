@@ -1,0 +1,447 @@
+/*
+ * Copyright 2026 Async-IO.org
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License"); you may not
+ * use this file except in compliance with the License. You may obtain a copy of
+ * the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ */
+// ABOUTME: Stub implementations of protocol abstractions for MCP server unit tests.
+// ABOUTME: Each stub returns configurable values, enabling tests without real macOS system APIs.
+
+import AppKit
+import CoreGraphics
+import Foundation
+import HelperLib
+@testable import mirroir_mcp
+
+// MARK: - StubBridge
+
+final class StubBridge: MenuActionCapable, @unchecked Sendable {
+    var targetName: String = "iphone"
+    var windowInfo: WindowInfo? = WindowInfo(
+        windowID: 1,
+        position: .zero,
+        size: CGSize(width: 410, height: 898),
+        pid: 1
+    )
+    var state: WindowState = .connected
+    var orientation: DeviceOrientation? = .portrait
+    var menuActionResult = true
+    var pressResumeResult = true
+    var processRunning = true
+    /// When true, a `pressResume()` call flips `state` to `.connected` (simulates
+    /// the plain resume overlay being dismissed by AX-press).
+    var connectOnResume = false
+    /// Screen point returned for the paused-overlay dismiss button (nil = none).
+    var pausedButtonPoint: CGPoint?
+    /// Whether the target reports owning the frontmost window.
+    var frontmost = true
+    /// Records menu action calls for verification.
+    var menuActionCalls: [(menu: String, item: String)] = []
+
+    func findProcess() -> NSRunningApplication? {
+        processRunning ? NSRunningApplication.current : nil
+    }
+
+    func getWindowInfo() -> WindowInfo? {
+        windowInfo
+    }
+
+    /// When set, `getState()` reports `.connected` from this instant on
+    /// (simulates an overlay that fades a moment after the session resumed).
+    var connectsAt: Date?
+
+    func getState() -> WindowState {
+        if let connectsAt, Date() >= connectsAt { state = .connected }
+        return state
+    }
+
+    func getOrientation() -> DeviceOrientation? {
+        orientation
+    }
+
+    func activate() {}
+
+    func isFrontmost() -> Bool {
+        frontmost
+    }
+
+    func triggerMenuAction(menu: String, item: String) -> Bool {
+        menuActionCalls.append((menu: menu, item: item))
+        return menuActionResult
+    }
+
+    /// What `pressMenuItem(commandKey:)` answers; false = no such item, as on
+    /// an iPhone Mirroring without Control Centre.
+    var menuItemResult = false
+    /// The state the session is in after a pressed menu item (nil = unchanged);
+    /// `.paused` stands for Mirroring's "Update Required" refusal.
+    var stateAfterMenuItem: WindowState?
+    /// Records the key equivalents pressed.
+    var menuItemCalls: [String] = []
+
+    func pressMenuItem(commandKey: String) -> Bool {
+        menuItemCalls.append(commandKey)
+        if menuItemResult, let stateAfterMenuItem { state = stateAfterMenuItem }
+        return menuItemResult
+    }
+
+    /// Successive `pressResume()` results; when empty, `pressResumeResult` answers.
+    var pressResumeResults: [Bool] = []
+
+    /// Number of `pressResume()` calls.
+    var pressResumeCount = 0
+
+    func pressResume() -> Bool {
+        pressResumeCount += 1
+        if connectOnResume { state = .connected }
+        if !pressResumeResults.isEmpty { return pressResumeResults.removeFirst() }
+        return pressResumeResult
+    }
+
+    func pausedDismissButtonPoint() -> CGPoint? {
+        pausedButtonPoint
+    }
+
+    /// What `sessionBlock()` reports while paused (nil = nothing to quote).
+    var block: SessionBlock?
+
+    func sessionBlock() -> SessionBlock? {
+        getState() == .paused ? block : nil
+    }
+
+    /// State a background launch leaves the target in; nil refuses the launch.
+    var launchedState: WindowState?
+    /// Number of `launchInBackground()` calls.
+    var launchCount = 0
+
+    func launchInBackground() -> Bool {
+        launchCount += 1
+        guard let launchedState else { return false }
+        state = launchedState
+        return true
+    }
+}
+
+// MARK: - StubInput
+
+/// Recorded arguments from a single swipe() call.
+struct SwipeCall {
+    let fromX: Double, fromY: Double, toX: Double, toY: Double, durationMs: Int
+}
+
+final class StubInput: InputProviding, @unchecked Sendable {
+    var tapResult: String?
+    var swipeResult: String?
+    var dragResult: String?
+    var longPressResult: String?
+    var doubleTapResult: String?
+    var shakeResult = TypeResult(success: true, error: nil)
+    var typeTextResult = TypeResult(success: true, error: nil)
+    var pressKeyResult = TypeResult(success: true, error: nil)
+    var launchAppResult: String?
+    var openURLResult: String?
+
+    /// Records every swipe() invocation for coordinate verification.
+    var swipeCalls: [SwipeCall] = []
+    /// Records every tap() invocation for verification.
+    var tapCalls: [(x: Double, y: Double)] = []
+    /// Records every typeText() invocation.
+    var typeCalls: [String] = []
+    /// Records every launchApp() invocation.
+    var launchAppCalls: [String] = []
+
+    func tap(x: Double, y: Double, cursorMode: CursorMode? = nil) -> String? {
+        tapCalls.append((x: x, y: y))
+        return tapResult
+    }
+    func swipe(fromX: Double, fromY: Double, toX: Double, toY: Double,
+               durationMs: Int, cursorMode: CursorMode? = nil) -> String? {
+        swipeCalls.append(SwipeCall(fromX: fromX, fromY: fromY,
+                                    toX: toX, toY: toY, durationMs: durationMs))
+        return swipeResult
+    }
+    /// Records every drag() invocation as from and to points.
+    var dragCalls: [(fromX: Double, fromY: Double, toX: Double, toY: Double)] = []
+
+    func drag(fromX: Double, fromY: Double, toX: Double, toY: Double,
+              durationMs: Int, cursorMode: CursorMode? = nil) -> String? {
+        dragCalls.append((fromX: fromX, fromY: fromY, toX: toX, toY: toY))
+        return dragResult
+    }
+    func longPress(x: Double, y: Double, durationMs: Int, cursorMode: CursorMode? = nil) -> String? { longPressResult }
+    func doubleTap(x: Double, y: Double, cursorMode: CursorMode? = nil) -> String? { doubleTapResult }
+    /// How many times shake() was called.
+    var shakeCalls = 0
+    func shake() -> TypeResult {
+        shakeCalls += 1
+        return shakeResult
+    }
+    /// Every typeText() and pressKey() call in order, as "type:<text>" and
+    /// "key:<modifiers+>key", for checking what reaches the keyboard first.
+    var keyboardLog: [String] = []
+    /// A key's own result, answered instead of `pressKeyResult` for that key.
+    var pressKeyResultByKey: [String: TypeResult] = [:]
+    func typeText(_ text: String) -> TypeResult {
+        typeCalls.append(text)
+        keyboardLog.append("type:\(text)")
+        return typeTextResult
+    }
+    /// Every keyboard_layout given, and the refusal to answer instead of nil.
+    var rememberedLayouts: [String] = []
+    var rememberLayoutRefusal: String?
+    func rememberKeyboardLayout(_ name: String) -> String? {
+        rememberedLayouts.append(name)
+        return rememberLayoutRefusal
+    }
+    func pressKey(keyName: String, modifiers: [String]) -> TypeResult {
+        keyboardLog.append("key:" + (modifiers + [keyName]).joined(separator: "+"))
+        return pressKeyResultByKey[keyName] ?? pressKeyResult
+    }
+    /// What `ensureConnected` answers: nil for a connected target, else the refusal.
+    var ensureConnectedResult: String?
+    func ensureConnected(tag: String) -> String? { ensureConnectedResult }
+    func launchApp(name: String) -> String? {
+        launchAppCalls.append(name)
+        return launchAppResult
+    }
+    /// Records every openURL() invocation.
+    var openURLCalls: [String] = []
+    func openURL(_ url: String) -> String? {
+        openURLCalls.append(url)
+        return openURLResult
+    }
+
+    /// Result returned by touch(); nil answers with the outcome the command implies.
+    var touchResult: Result<TouchOutcome, TouchSessionError>?
+    /// Records every touch() invocation.
+    var touchCalls: [TouchCommand] = []
+
+    func touch(_ command: TouchCommand) -> Result<TouchOutcome, TouchSessionError> {
+        touchCalls.append(command)
+        if let touchResult { return touchResult }
+        switch command {
+        case .begin(let x, let y): return .success(.began(at: CGPoint(x: x, y: y)))
+        case .move(let x, let y, _): return .success(.moved(to: CGPoint(x: x, y: y)))
+        case .end: return .success(.ended(at: .zero))
+        case .cancel: return .success(.cancelled(releasedAt: nil))
+        }
+    }
+
+    /// Result returned by gesture().
+    var gestureResult: String?
+    /// Records every gesture() invocation.
+    var gestureCalls: [GestureRequest] = []
+
+    func gesture(_ request: GestureRequest) -> String? {
+        gestureCalls.append(request)
+        return gestureResult
+    }
+
+    /// Result returned by holdKeys().
+    var holdKeysResult: String?
+    /// Records every holdKeys() invocation.
+    var holdKeysCalls: [HeldKeysRequest] = []
+
+    func holdKeys(_ request: HeldKeysRequest) -> String? {
+        holdKeysCalls.append(request)
+        return holdKeysResult
+    }
+}
+
+// MARK: - StubCapture
+
+final class StubCapture: ScreenCapturing, @unchecked Sendable {
+    var captureResult: String?
+    var windowInfo: WindowInfo = WindowInfo(
+        windowID: 1, position: .zero, size: CGSize(width: 410, height: 898), pid: 1
+    )
+
+    func captureWithInfo() -> CaptureResult? {
+        guard let data = captureData() else { return nil }
+        return CaptureResult(data: data, info: windowInfo)
+    }
+
+    func captureData() -> Data? {
+        guard let captureResult else { return nil }
+        return Data(base64Encoded: captureResult)
+    }
+
+    func captureBase64() -> String? {
+        captureResult
+    }
+}
+
+// MARK: - StubRecorder
+
+final class StubRecorder: ScreenRecording, @unchecked Sendable {
+    var startResult: String?
+    var stopResult = RecordingStop(filePath: "/tmp/test.mov", error: nil)
+
+    func startRecording(outputPath: String?) -> String? {
+        startResult
+    }
+
+    func stopRecording() -> RecordingStop {
+        stopResult
+    }
+}
+
+// MARK: - StubTextRecognizer
+
+/// Stub for TextRecognizing that returns configurable elements without
+/// running real Vision OCR, enabling deterministic unit tests.
+///
+/// Set `failure` to make it behave like an engine that broke rather than a
+/// screen that held no text — the distinction issue #36 turned on.
+final class StubTextRecognizer: TextRecognizing, @unchecked Sendable {
+    var elements: [RawTextElement] = []
+    var failure: (any Error)?
+
+    func recognizeText(
+        in image: CGImage,
+        windowSize: CGSize,
+        contentBounds: CGRect
+    ) throws -> [RawTextElement] {
+        if let failure { throw failure }
+        return elements
+    }
+}
+
+// MARK: - Frame capture doubles
+
+/// Capture double that replays a fixed sequence of frames (repeating the last)
+/// and counts calls, so a test can tell a settled capture from a single grab.
+final class SequenceCapture: ScreenCapturing, @unchecked Sendable {
+    private let frames: [Data]
+    private(set) var callCount = 0
+    let windowInfo: WindowInfo
+
+    init(frames: [Data], windowSize: CGSize = CGSize(width: 410, height: 898)) {
+        self.frames = frames
+        self.windowInfo = WindowInfo(windowID: 1, position: .zero, size: windowSize, pid: 1)
+    }
+
+    func captureWithInfo() -> CaptureResult? {
+        let frame = frames[min(callCount, frames.count - 1)]
+        callCount += 1
+        return CaptureResult(data: frame, info: windowInfo)
+    }
+
+    func captureData() -> Data? { captureWithInfo()?.data }
+    func captureBase64() -> String? { captureData()?.base64EncodedString() }
+}
+
+/// Counts chat-completion requests the vision describer sends.
+final class RequestCounter: @unchecked Sendable {
+    private(set) var count = 0
+    func record() { count += 1 }
+}
+/// Vision describer whose agent replies with one "Play" button and counts
+/// every request, so a test can prove when the paid call was (not) made.
+/// `recognizer` drives the local OCR pass that confirms a blank frame.
+func makeTestVisionDescriber(
+    capture: any ScreenCapturing, counter: RequestCounter,
+    recognizer: any TextRecognizing = StubTextRecognizer()
+) -> VisionScreenDescriber {
+    let config = AgentConfig(
+        name: "test", mode: .api, provider: nil, model: "test-model",
+        apiKeyEnvVar: nil, baseURL: "http://127.0.0.1:1", systemPrompt: nil,
+        maxTokens: 256, command: nil, args: nil
+    )
+    let reply = #"{"choices":[{"message":{"content":"[{\"label\":\"Play\",\"x\":100,\"y\":50,\"type\":\"button\"}]"}}]}"#
+    let local = ScreenDescriber(bridge: StubBridge(), capture: capture, textRecognizer: recognizer)
+    return VisionScreenDescriber(
+        bridge: StubBridge(), capture: capture, localDescriber: local, agentConfig: config,
+        sendRequest: { _, _, _, _, _ in
+            counter.record()
+            return Data(reply.utf8)
+        }
+    )
+}
+
+// MARK: - StubDescriber
+
+final class StubDescriber: ScreenDescribing, @unchecked Sendable {
+    var describeResult: ScreenDescriber.DescribeResult?
+
+    /// Sequential results returned by successive describe() calls.
+    /// When set, each call returns the next result (falling back to the last).
+    var describeResults: [ScreenDescriber.DescribeResult?] = []
+    private var describeIndex = 0
+
+    /// Number of describe() calls made, so tests can prove a describer was not used.
+    private(set) var describeCallCount = 0
+
+    /// Settle window of the most recent describe call (nil = describer default).
+    private(set) var lastSettleTimeoutUs: UInt32?
+
+    /// Settle window of every describe call, in call order.
+    private(set) var settleTimeouts: [UInt32?] = []
+
+    func describe(settleTimeoutUs: UInt32?) -> ScreenDescriber.DescribeResult? {
+        describeCallCount += 1
+        lastSettleTimeoutUs = settleTimeoutUs
+        settleTimeouts.append(settleTimeoutUs)
+        if !describeResults.isEmpty {
+            let result = describeResults[min(describeIndex, describeResults.count - 1)]
+            describeIndex += 1
+            return result
+        }
+        return describeResult
+    }
+}
+
+// MARK: - TargetRegistry helpers for tests
+
+/// Creates a TargetRegistry with a single "iphone" target from the given stubs.
+func makeTestRegistry(
+    bridge: StubBridge,
+    input: StubInput,
+    capture: StubCapture = StubCapture(),
+    recorder: StubRecorder = StubRecorder(),
+    describer: StubDescriber = StubDescriber(),
+    ocrDescriber: StubDescriber? = nil
+) -> TargetRegistry {
+    let ctx = TargetContext(
+        name: "iphone",
+        targetType: "iphone-mirroring",
+        bundleID: nil,
+        bridge: bridge,
+        input: input,
+        capture: capture,
+        describer: describer,
+        ocrDescriber: ocrDescriber,
+        recorder: recorder
+    )
+    return TargetRegistry(targets: ["iphone": ctx], defaultName: "iphone")
+}
+
+// MARK: - RecordingPasteboard
+
+/// The Mac pasteboard as a value: records every write instead of touching the
+/// real general pasteboard the developer running the tests is using.
+final class RecordingPasteboard: PasteboardAccessing, @unchecked Sendable {
+    private(set) var contents: String?
+    private(set) var writes: [String] = []
+
+    init(contents: String?) {
+        self.contents = contents
+    }
+
+    func string() -> String? { contents }
+
+    func replaceContents(with text: String) -> Bool {
+        writes.append(text)
+        contents = text
+        return true
+    }
+}

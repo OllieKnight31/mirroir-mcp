@@ -1,0 +1,447 @@
+/*
+ * Copyright 2026 Async-IO.org
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License"); you may not
+ * use this file except in compliance with the License. You may obtain a copy of
+ * the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ */
+// ABOUTME: Tests for CompiledStepExecutor: replay of compiled steps using cached hints.
+// ABOUTME: Covers coordinate-only taps checked by the screen they reach, assertions, scroll failures, passthrough and no-hint steps.
+
+import XCTest
+@testable import HelperLib
+@testable import mirroir_mcp
+
+final class CompiledStepExecutorTests: XCTestCase {
+
+    private var bridge: StubBridge!
+    private var input: StubInput!
+    private var describer: StubDescriber!
+    private var capture: StubCapture!
+    private var compiledExecutor: CompiledStepExecutor!
+
+    override func setUp() {
+        super.setUp()
+        bridge = StubBridge()
+        input = StubInput()
+        describer = StubDescriber()
+        capture = StubCapture()
+
+        let config = StepExecutorConfig(
+            waitForTimeoutSeconds: 2,
+            settlingDelayMs: 0,  // No delay in tests
+            screenshotDir: NSTemporaryDirectory() + "test-compiled-\(UUID().uuidString)",
+            dryRun: false
+        )
+        compiledExecutor = CompiledStepExecutor(
+            bridge: bridge, input: input,
+            describer: describer, capture: capture,
+            config: config
+        )
+    }
+
+    // MARK: - Compiled Tap
+
+    /// A screen showing `texts`, as the stub describer returns it.
+    private func screen(_ texts: [String]) -> ScreenDescriber.DescribeResult {
+        ScreenDescriber.DescribeResult(
+            elements: texts.enumerated().map { index, text in
+                TapPoint(text: text, tapX: 100, tapY: Double(100 + 60 * index), confidence: 0.9)
+            },
+            screenshotBase64: "")
+    }
+
+    private func fingerprint(_ texts: [String]) -> ScreenFingerprint {
+        StructuralFingerprint.buildScreenFingerprint(elements: screen(texts).elements, icons: [])
+    }
+
+    private func coordinateTap(arrival: ScreenFingerprint?) -> StepResult {
+        let compiledStep = CompiledStep(
+            index: 0, type: "tap", label: nil,
+            hints: .tap(x: 40.0, y: 880.0, strategy: "unknown", arrival: arrival))
+        return compiledExecutor.execute(
+            step: .tap(label: ""), compiledStep: compiledStep, stepIndex: 0, skillName: "test")
+    }
+
+    private let home = ["Calendrier", "Horloge", "Météo", "Réglages", "Plans"]
+    private let settings = ["Settings", "General", "Privacy", "Battery", "Display"]
+
+    func testACoordinateOnlyTapThatReachesTheRecordedScreenPasses() {
+        describer.describeResults = [screen(home), screen(settings)]
+
+        let result = coordinateTap(arrival: fingerprint(settings))
+
+        XCTAssertEqual(result.status, .passed, result.message ?? "")
+        XCTAssertEqual(input.tapCalls.count, 1)
+        XCTAssertEqual(input.tapCalls[0].x, 40.0)
+        XCTAssertTrue(result.message?.contains("reached the recorded screen") ?? false)
+    }
+
+    func testACoordinateOnlyTapWaitsForAScreenStillLoading() {
+        // The first read after the tap catches the transition; a later one lands.
+        describer.describeResults = [screen(home), screen(["Loading"]), screen(settings)]
+
+        let result = coordinateTap(arrival: fingerprint(settings))
+
+        XCTAssertEqual(result.status, .passed, result.message ?? "")
+    }
+
+    func testACoordinateOnlyTapThatReachesAnotherScreenFails() {
+        // The icon moved or a sheet covered it: the tap landed, the app went elsewhere.
+        describer.describeResults = [
+            screen(home), screen(["Photos", "Albums", "Library", "Search", "For You"]),
+        ]
+
+        let result = coordinateTap(arrival: fingerprint(settings))
+
+        XCTAssertEqual(result.status, .failed)
+        XCTAssertTrue(result.message?.contains("did not reach the recorded screen") ?? false,
+                      result.message ?? "")
+    }
+
+    func testACoordinateOnlyTapIsNotSentWhenTheScreenAlreadyMatchesItsDestination() {
+        // A like or play icon stays on its screen: a dropped tap would look the same.
+        describer.describeResult = screen(settings)
+
+        let result = coordinateTap(arrival: fingerprint(settings))
+
+        XCTAssertEqual(result.status, .failed)
+        XCTAssertTrue(input.tapCalls.isEmpty)
+        XCTAssertTrue(result.message?.contains("could not be proven") ?? false,
+                      result.message ?? "")
+    }
+
+    func testACoordinateOnlyTapToABareScreenIsNotSent() {
+        // A camera or game screen has no labels: any screen would "match" it.
+        describer.describeResult = screen(home)
+
+        let result = coordinateTap(arrival: fingerprint(["OK"]))
+
+        XCTAssertEqual(result.status, .failed)
+        XCTAssertTrue(input.tapCalls.isEmpty)
+        XCTAssertTrue(result.message?.contains("too little text") ?? false, result.message ?? "")
+    }
+
+    func testACoordinateOnlyTapWithNoRecordedScreenFailsWithoutTapping() {
+        let result = coordinateTap(arrival: nil)
+
+        XCTAssertEqual(result.status, .failed)
+        XCTAssertTrue(input.tapCalls.isEmpty, "nothing to check it against, so nothing is sent")
+        XCTAssertTrue(result.message?.contains("recompile") ?? false, result.message ?? "")
+    }
+
+    func testACoordinateOnlyTapFailsWhenTheScreenCannotBeReadAfterward() {
+        describer.describeResults = [screen(home), nil]
+
+        let result = coordinateTap(arrival: fingerprint(settings))
+
+        XCTAssertEqual(result.status, .failed)
+        XCTAssertEqual(input.tapCalls.count, 1)
+        XCTAssertTrue(result.message?.contains("could not be checked") ?? false,
+                      result.message ?? "")
+    }
+
+    func testKeyboardLettersDoNotDecideTheArrivalCheck() {
+        let keys = (UnicodeScalar("a").value...UnicodeScalar("z").value)
+            .compactMap(UnicodeScalar.init).map { String(Character($0)) }
+        let compose = fingerprint(["New Message", "Cancel", "Send"] + keys)
+        let search = fingerprint(["Search", "Recents", "Suggestions"] + keys)
+        XCTAssertFalse(ArrivalCheck.matches(compose, search),
+                       "two keyboard-up screens are told apart by their labels")
+    }
+
+    func testCompiledTapMissingCoordinatesFails() {
+        let step = SkillStep.tap(label: "General")
+        let hints = StepHints(
+            compiledAction: .tap, tapX: nil, tapY: nil,
+            matchStrategy: nil,
+            observedDelayMs: nil, scrollCount: nil, scrollDirection: nil
+        )
+        let compiledStep = CompiledStep(
+            index: 0, type: "tap", label: "General", hints: hints)
+
+        let result = compiledExecutor.execute(
+            step: step, compiledStep: compiledStep,
+            stepIndex: 0, skillName: "test")
+
+        XCTAssertEqual(result.status, .failed)
+        XCTAssertTrue(result.message?.contains("missing coordinates") ?? false)
+    }
+
+    // MARK: - Compiled Assertion
+
+    func testCompiledAssertVisiblePerformsOCR() {
+        describer.describeResult = ScreenDescriber.DescribeResult(
+            elements: [TapPoint(text: "OK", tapX: 100, tapY: 200, confidence: 0.9)],
+            screenshotBase64: ""
+        )
+
+        let step = SkillStep.assertVisible(label: "OK")
+        let compiledStep = CompiledStep(
+            index: 0, type: "assert_visible", label: "OK",
+            hints: .assertion(delayMs: 0)
+        )
+
+        let result = compiledExecutor.execute(
+            step: step, compiledStep: compiledStep,
+            stepIndex: 0, skillName: "test")
+
+        XCTAssertEqual(result.status, .passed)
+    }
+
+    func testCompiledAssertVisibleFailsWhenMissing() {
+        describer.describeResult = ScreenDescriber.DescribeResult(
+            elements: [TapPoint(text: "Cancel", tapX: 100, tapY: 200, confidence: 0.9)],
+            screenshotBase64: ""
+        )
+
+        let step = SkillStep.assertVisible(label: "OK")
+        let compiledStep = CompiledStep(
+            index: 0, type: "assert_visible", label: "OK",
+            hints: .assertion(delayMs: 0)
+        )
+
+        let result = compiledExecutor.execute(
+            step: step, compiledStep: compiledStep,
+            stepIndex: 0, skillName: "test")
+
+        XCTAssertEqual(result.status, .failed)
+        XCTAssertTrue(result.message?.contains("visible") ?? false)
+    }
+
+    func testCompiledAssertNotVisiblePasses() {
+        describer.describeResult = ScreenDescriber.DescribeResult(
+            elements: [TapPoint(text: "Cancel", tapX: 100, tapY: 200, confidence: 0.9)],
+            screenshotBase64: ""
+        )
+
+        let step = SkillStep.assertNotVisible(label: "OK")
+        let compiledStep = CompiledStep(
+            index: 0, type: "assert_not_visible", label: "OK",
+            hints: .assertion(delayMs: 0)
+        )
+
+        let result = compiledExecutor.execute(
+            step: step, compiledStep: compiledStep,
+            stepIndex: 0, skillName: "test")
+
+        XCTAssertEqual(result.status, .passed)
+    }
+
+    func testCompiledAssertNotVisibleFailsWhenPresent() {
+        describer.describeResult = ScreenDescriber.DescribeResult(
+            elements: [TapPoint(text: "OK", tapX: 100, tapY: 200, confidence: 0.9)],
+            screenshotBase64: ""
+        )
+
+        let step = SkillStep.assertNotVisible(label: "OK")
+        let compiledStep = CompiledStep(
+            index: 0, type: "assert_not_visible", label: "OK",
+            hints: .assertion(delayMs: 0)
+        )
+
+        let result = compiledExecutor.execute(
+            step: step, compiledStep: compiledStep,
+            stepIndex: 0, skillName: "test")
+
+        XCTAssertEqual(result.status, .failed)
+        XCTAssertTrue(result.message?.contains("NOT be visible") ?? false)
+    }
+
+    // MARK: - Compiled Scroll Sequence
+
+    func testCompiledScrollSequencePerformsCorrectSwipes() {
+        // Post-scroll OCR verification needs to find "About" on screen
+        let aboutElement = TapPoint(text: "About", tapX: 100, tapY: 300, confidence: 0.95)
+        describer.describeResult = ScreenDescriber.DescribeResult(
+            elements: [aboutElement], hints: [], screenshotBase64: "", ocrTimeMs: 0)
+
+        let step = SkillStep.scrollTo(label: "About", direction: .down, maxScrolls: 10)
+        let compiledStep = CompiledStep(
+            index: 0, type: "scroll_to", label: "About",
+            hints: .scrollSequence(count: 3, direction: "down")
+        )
+
+        let result = compiledExecutor.execute(
+            step: step, compiledStep: compiledStep,
+            stepIndex: 0, skillName: "test")
+
+        XCTAssertEqual(result.status, .passed)
+        XCTAssertEqual(input.swipeCalls.count, 3)
+        XCTAssertTrue(result.message?.contains("3 scroll(s)") ?? false)
+    }
+
+    func testCompiledScrollSequenceNoWindowInfo() {
+        bridge.windowInfo = nil
+
+        let step = SkillStep.scrollTo(label: "About", direction: .down, maxScrolls: 10)
+        let compiledStep = CompiledStep(
+            index: 0, type: "scroll_to", label: "About",
+            hints: .scrollSequence(count: 2, direction: "down")
+        )
+
+        let result = compiledExecutor.execute(
+            step: step, compiledStep: compiledStep,
+            stepIndex: 0, skillName: "test")
+
+        XCTAssertEqual(result.status, .failed)
+        XCTAssertTrue(result.message?.contains("window info") ?? false)
+    }
+
+    func testCompiledScrollSequenceSwipeError() {
+        input.swipeResult = "Swipe failed"
+
+        let step = SkillStep.scrollTo(label: "About", direction: .down, maxScrolls: 10)
+        let compiledStep = CompiledStep(
+            index: 0, type: "scroll_to", label: "About",
+            hints: .scrollSequence(count: 2, direction: "down")
+        )
+
+        let result = compiledExecutor.execute(
+            step: step, compiledStep: compiledStep,
+            stepIndex: 0, skillName: "test")
+
+        XCTAssertEqual(result.status, .failed)
+    }
+
+    // MARK: - Passthrough
+
+    func testPassthroughDelegatesToNormalExecutor() {
+        input.launchAppResult = nil  // success
+
+        let step = SkillStep.launch(appName: "Settings")
+        let compiledStep = CompiledStep(
+            index: 0, type: "launch", label: "Settings",
+            hints: .passthrough()
+        )
+
+        let result = compiledExecutor.execute(
+            step: step, compiledStep: compiledStep,
+            stepIndex: 0, skillName: "test")
+
+        XCTAssertEqual(result.status, .passed)
+        XCTAssertEqual(input.launchAppCalls, ["Settings"])
+    }
+
+    func testPassthroughHomeStep() {
+        bridge.menuActionResult = true
+
+        let step = SkillStep.home
+        let compiledStep = CompiledStep(
+            index: 0, type: "home", label: nil,
+            hints: .passthrough()
+        )
+
+        let result = compiledExecutor.execute(
+            step: step, compiledStep: compiledStep,
+            stepIndex: 0, skillName: "test")
+
+        XCTAssertEqual(result.status, .passed)
+    }
+
+    // MARK: - No Hints
+
+    /// A step compiled without hints has nothing to replay from, so it runs
+    /// live: the launch really happens and its own result is reported.
+    func testNoHintsRunsTheStepLive() {
+        let step = SkillStep.launch(appName: "Clock")
+        let compiledStep = CompiledStep(
+            index: 0, type: "launch", label: "Clock", hints: nil)
+
+        let result = compiledExecutor.execute(
+            step: step, compiledStep: compiledStep,
+            stepIndex: 0, skillName: "test")
+
+        XCTAssertEqual(result.status, .passed)
+        XCTAssertEqual(input.launchAppCalls, ["Clock"])
+    }
+
+    /// Run live, a failing step without hints fails rather than being skipped.
+    func testNoHintsFailingStepFails() {
+        describer.describeResult = ScreenDescriber.DescribeResult(
+            elements: [TapPoint(text: "Cancel", tapX: 100, tapY: 200, confidence: 0.9)],
+            screenshotBase64: "")
+        let step = SkillStep.assertVisible(label: "Alarms")
+        let compiledStep = CompiledStep(
+            index: 0, type: "assert_visible", label: "Alarms", hints: nil)
+
+        let result = compiledExecutor.execute(
+            step: step, compiledStep: compiledStep,
+            stepIndex: 0, skillName: "test")
+
+        XCTAssertEqual(result.status, .failed)
+    }
+
+    func testAIOnlyStepWithoutHintsIsNotEvaluated() {
+        let step = SkillStep.skipped(stepType: "remember", reason: "AI-only")
+        let compiledStep = CompiledStep(
+            index: 0, type: "remember", label: nil, hints: nil)
+
+        let result = compiledExecutor.execute(
+            step: step, compiledStep: compiledStep,
+            stepIndex: 0, skillName: "test")
+
+        XCTAssertEqual(result.status, .notEvaluated)
+    }
+
+    // MARK: - RecordingDescriber
+
+    func testRecordingDescriberCachesLastResult() {
+        let inner = StubDescriber()
+        let expected = ScreenDescriber.DescribeResult(
+            elements: [TapPoint(text: "Test", tapX: 100, tapY: 200, confidence: 0.9)],
+            screenshotBase64: ""
+        )
+        inner.describeResult = expected
+
+        let recording = RecordingDescriber(wrapping: inner)
+        XCTAssertNil(recording.lastResult)
+        XCTAssertEqual(recording.callCount, 0)
+
+        let result = recording.describe()
+        XCTAssertEqual(result?.elements.count, 1)
+        XCTAssertEqual(recording.lastResult?.elements.count, 1)
+        XCTAssertEqual(recording.callCount, 1)
+    }
+
+    func testRecordingDescriberHandlesNilResult() {
+        let inner = StubDescriber()
+        inner.describeResult = nil
+
+        let recording = RecordingDescriber(wrapping: inner)
+        let result = recording.describe()
+
+        XCTAssertNil(result)
+        XCTAssertNil(recording.lastResult)
+        XCTAssertEqual(recording.callCount, 1)
+    }
+
+    func testRecordingDescriberKeepsTheLatestResult() {
+        let inner = StubDescriber()
+        let first = ScreenDescriber.DescribeResult(
+            elements: [TapPoint(text: "First", tapX: 100, tapY: 200, confidence: 0.9)],
+            screenshotBase64: "")
+        let second = ScreenDescriber.DescribeResult(
+            elements: [TapPoint(text: "Second", tapX: 100, tapY: 200, confidence: 0.9)],
+            screenshotBase64: "")
+        inner.describeResults = [first, second]
+
+        let recording = RecordingDescriber(wrapping: inner)
+        XCTAssertNil(recording.lastResult)
+
+        _ = recording.describe()
+        XCTAssertEqual(recording.lastResult?.elements.first?.text, "First")
+
+        _ = recording.describe()
+        XCTAssertEqual(recording.lastResult?.elements.first?.text, "Second")
+        XCTAssertEqual(recording.callCount, 2)
+    }
+}

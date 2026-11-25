@@ -1,0 +1,166 @@
+/*
+ * Copyright 2026 Async-IO.org
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License"); you may not
+ * use this file except in compliance with the License. You may obtain a copy of
+ * the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ */
+// ABOUTME: Tests launch_app's confirmation that Spotlight closed, including the no-match case.
+// ABOUTME: Uses OCR shapes captured on device: an empty Spotlight shows only "Q <query>" in its field.
+
+import XCTest
+@testable import mirroir_mcp
+@testable import HelperLib
+
+final class LaunchAppConfirmationTests: XCTestCase {
+
+    private let height = 898.0
+
+    private func point(_ text: String, y: Double) -> TapPoint {
+        TapPoint(text: text, tapX: 200, tapY: y, confidence: 0.9)
+    }
+
+    private func screen(_ elements: [TapPoint]) -> ScreenDescriber.DescribeResult {
+        ScreenDescriber.DescribeResult(elements: elements, screenshotBase64: "img")
+    }
+
+    private func outcome(_ results: [ScreenDescriber.DescribeResult?], name: String) -> MCPToolResult {
+        let describer = StubDescriber()
+        describer.describeResults = results
+        return LaunchAppConfirmation.outcome(
+            appName: name, describer: describer, windowHeight: height, settleUs: 0, retryDelayUs: 0
+        )
+    }
+
+    private func text(_ result: MCPToolResult) -> String {
+        result.content.compactMap { part -> String? in
+            if case .text(let value) = part { return value }
+            return nil
+        }.joined()
+    }
+
+    // MARK: - Search-field echo
+
+    func testEchoWithGlyphAtBottomIsDetected() {
+        let elements = [point("Q Maps", y: 830)]
+        XCTAssertTrue(SpotlightDetector.isQueryEchoedInSearchField(elements: elements, query: "Maps", windowHeight: height))
+    }
+
+    func testTruncatedEchoIsDetected() {
+        let elements = [point("Q MultiTouch-Visualize", y: 829)]
+        XCTAssertTrue(SpotlightDetector.isQueryEchoedInSearchField(
+            elements: elements, query: "MultiTouch-Visualizer", windowHeight: height))
+    }
+
+    func testQueryTextHigherOnScreenIsNotAnEcho() {
+        let elements = [point("Maps", y: 300)]
+        XCTAssertFalse(SpotlightDetector.isQueryEchoedInSearchField(elements: elements, query: "Maps", windowHeight: height))
+    }
+
+    func testAppSearchBarWithOtherWordsIsNotAnEcho() {
+        let elements = [point("Search Maps", y: 830)]
+        XCTAssertFalse(SpotlightDetector.isQueryEchoedInSearchField(elements: elements, query: "Maps", windowHeight: height))
+    }
+
+    func testAppTabLabelWithoutGlyphIsNotAnEcho() {
+        // Device capture: launching "Horloge" opens Clock, whose tab bar shows "Horloges".
+        let elements = [point("Horloges", y: 892)]
+        XCTAssertFalse(SpotlightDetector.isQueryEchoedInSearchField(
+            elements: elements, query: "Horloge", windowHeight: height))
+    }
+
+    func testHomeScreenSearchPillIsDetected() {
+        let elements = [point("Horloge", y: 290), point("Q Rechercher", y: 783)]
+        XCTAssertTrue(SpotlightDetector.isHomeScreenVisible(elements: elements, windowHeight: height))
+    }
+
+    /// iOS 27 layout (410x898, field at the top, carnet#69). Synthesized from
+    /// the measured shape of the bottom field ("Q <query>"), moved to the top:
+    /// no top-field OCR capture of that phone exists.
+    func testEchoInATopSearchFieldIsDetected() {
+        let elements = [point("Meilleur résultat", y: 190), point("Q Maps", y: 92)]
+        XCTAssertTrue(SpotlightDetector.isQueryEchoedInSearchField(elements: elements, query: "Maps", windowHeight: height))
+    }
+
+    func testAnEchoMidScreenIsNeitherLayout() {
+        let elements = [point("Q Maps", y: 450)]
+        XCTAssertFalse(SpotlightDetector.isQueryEchoedInSearchField(elements: elements, query: "Maps", windowHeight: height))
+    }
+
+    func testATopFieldStillLaunchedIsReportedAsSpotlightStillOpen() {
+        let stuck = screen([point("Q Maps", y: 92)])
+        let result = outcome([stuck], name: "Maps")
+        XCTAssertTrue(result.isError)
+        XCTAssertTrue(text(result).contains("Spotlight is still open"))
+    }
+
+    /// An app that opens on a search field at its top (Settings: "Q Rechercher")
+    /// is not the Home Screen: the pill is looked for at the bottom only.
+    func testAnAppsTopSearchFieldIsNotTheHomeScreen() {
+        let elements = [point("Réglages", y: 60), point("Q Rechercher", y: 120), point("Wi-Fi", y: 400)]
+        XCTAssertFalse(SpotlightDetector.isHomeScreenVisible(elements: elements, windowHeight: height))
+        let result = outcome([screen(elements)], name: "Réglages")
+        XCTAssertFalse(result.isError, text(result))
+    }
+
+    func testSingleGlyphNeverCountsAsEcho() {
+        let elements = [point("Q", y: 830)]
+        XCTAssertFalse(SpotlightDetector.isQueryEchoedInSearchField(elements: elements, query: "Maps", windowHeight: height))
+    }
+
+    // MARK: - Outcome
+
+    func testSpotlightGoneReportsLaunched() {
+        let result = outcome([screen([point("Rue de la Seve", y: 500)])], name: "Waze")
+        XCTAssertFalse(result.isError)
+        XCTAssertEqual(text(result), "Launched 'Waze'")
+    }
+
+    func testSpotlightStuckWithEchoReportsError() {
+        let stuck = screen([point("Q Maps", y: 830)])
+        let result = outcome([stuck], name: "Maps")
+        XCTAssertTrue(result.isError)
+        XCTAssertTrue(text(result).contains("Spotlight is still open"))
+    }
+
+    func testSpotlightClosingOnALaterPollReportsLaunched() {
+        let stuck = screen([point("Top Hit", y: 200)])
+        let open = screen([point("Photos", y: 120)])
+        let result = outcome([stuck, stuck, open], name: "Photos")
+        XCTAssertFalse(result.isError)
+    }
+
+    func testLaunchedAppWithMatchingTabLabelReportsLaunched() {
+        let clock = screen([point("Horloges", y: 150), point("Horloges", y: 892), point("Alarmes", y: 892)])
+        let result = outcome([clock], name: "Horloge")
+        XCTAssertFalse(result.isError)
+        XCTAssertEqual(text(result), "Launched 'Horloge'")
+    }
+
+    func testStillOnHomeScreenReportsError() {
+        let home = screen([point("Horloge", y: 290), point("Q Rechercher", y: 783)])
+        let result = outcome([home], name: "Horloge")
+        XCTAssertTrue(result.isError)
+        XCTAssertTrue(text(result).contains("home screen is still showing"))
+    }
+
+    func testUnreadableScreenIsNotClaimedAsConfirmed() {
+        let result = outcome([nil], name: "Maps")
+        XCTAssertFalse(result.isError)
+        XCTAssertTrue(text(result).contains("not confirmed"))
+    }
+
+    func testMissingWindowIsNotClaimedAsConfirmed() {
+        let result = LaunchAppConfirmation.outcome(
+            appName: "Maps", describer: StubDescriber(), windowHeight: nil, settleUs: 0, retryDelayUs: 0)
+        XCTAssertTrue(text(result).contains("not confirmed"))
+    }
+}

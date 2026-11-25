@@ -1,0 +1,166 @@
+/*
+ * Copyright 2026 Async-IO.org
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License"); you may not
+ * use this file except in compliance with the License. You may obtain a copy of
+ * the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ */
+// ABOUTME: Registers the measure MCP tool for timing screen transitions.
+// ABOUTME: Executes an action then polls OCR until a target label appears, reporting duration.
+
+import Foundation
+import HelperLib
+
+extension MirroirMCP {
+    static func registerMeasureTools(
+        server: MCPServer,
+        registry: TargetRegistry
+    ) {
+        // measure — time how long it takes for a label to appear after an action
+        server.registerTool(MCPToolDefinition(
+            name: "measure",
+            description: """
+                Measure the time between performing an action and a target element \
+                appearing on screen. Executes the action (tap, launch, etc.), then \
+                polls OCR until the target label is visible. Reports the measured \
+                duration and optionally fails if it exceeds a maximum threshold.
+                """,
+            inputSchema: [
+                "type": .string("object"),
+                "properties": .object([
+                    "action": .object([
+                        "type": .string("string"),
+                        "description": .string(
+                            "Action to perform: 'tap:Label', 'launch:AppName', or 'press_key:return'"),
+                    ]),
+                    "until": .object([
+                        "type": .string("string"),
+                        "description": .string("Text label to wait for after the action"),
+                    ]),
+                    "max_seconds": .object([
+                        "type": .string("number"),
+                        "description": .string(
+                            "Maximum allowed seconds (fails if exceeded). Optional."),
+                    ]),
+                    "name": .object([
+                        "type": .string("string"),
+                        "description": .string(
+                            "Name for this measurement (for reporting). Optional."),
+                    ]),
+                ]),
+                "required": .array([.string("action"), .string("until")]),
+            ],
+            contextualHandler: { args, context in
+                let (ctx, err) = registry.resolveForTool(args)
+                guard let ctx else { return err! }
+                let bridge = ctx.bridge
+                let input = ctx.input
+                let describer = ctx.ocrDescriber
+
+                guard let actionStr = args["action"]?.asString() else {
+                    return .error("Missing required parameter: action (string)")
+                }
+                guard let until = args["until"]?.asString() else {
+                    return .error("Missing required parameter: until (string)")
+                }
+
+                let maxSeconds = args["max_seconds"]?.asNumber()
+                let name = args["name"]?.asString() ?? "measure"
+
+                // `launch:` goes through iPhone Spotlight: on a target without
+                // it, the action is refused the way launch_app itself is.
+                if actionStr.trimmingCharacters(in: .whitespaces).hasPrefix(launchActionPrefix),
+                   let refusal = registry.refusal(of: .launchApp, on: ctx.profile, named: ctx.name) {
+                    return .error(refusal)
+                }
+
+                // Parse and execute the action
+                let actionError = executeAction(actionStr, bridge: bridge,
+                                                 input: input, describer: describer)
+                if let error = actionError {
+                    return .error("Action failed: \(error)")
+                }
+
+                // Start measuring
+                let measureStart = CFAbsoluteTimeGetCurrent()
+                let timeout = maxSeconds ?? EnvConfig.defaultMeasureTimeoutSeconds
+                let pollIntervalUs: useconds_t = EnvConfig.measurePollIntervalUs
+
+                let maxPolls = Int(timeout * 2)
+                for poll in 0..<maxPolls {
+                    if context.call.isCancelled {
+                        return .error("\(name): \(StepExecutor.cancelledMessage)")
+                    }
+                    context.call.report(progress: Double(poll + 1), total: Double(maxPolls))
+                    if let describeResult = describer.describe(),
+                       ElementMatcher.isVisible(label: until, in: describeResult.elements) {
+                        let measured = CFAbsoluteTimeGetCurrent() - measureStart
+                        if let max = maxSeconds, measured > max {
+                            return .error(
+                                "\(name): \(String(format: "%.3f", measured))s " +
+                                "exceeded \(String(format: "%.1f", max))s max")
+                        }
+                        return .text(
+                            "\(name): \(String(format: "%.3f", measured))s")
+                    }
+                    usleep(pollIntervalUs)
+                }
+
+                let measured = CFAbsoluteTimeGetCurrent() - measureStart
+                return .error(
+                    "\(name): timed out after \(String(format: "%.1f", measured))s " +
+                    "waiting for '\(until)'")
+            }
+        ))
+    }
+
+    /// How a `measure` action that launches an app starts.
+    static let launchActionPrefix = "launch:"
+
+    /// Parse an action string like "tap:Label" or "launch:AppName" and execute it.
+    private static func executeAction(
+        _ actionStr: String,
+        bridge: any WindowBridging,
+        input: any InputProviding,
+        describer: any ScreenDescribing
+    ) -> String? {
+        guard let colonIdx = actionStr.firstIndex(of: ":") else {
+            return "Invalid action format: '\(actionStr)'. Use 'tap:Label' or 'launch:AppName'."
+        }
+
+        let actionType = String(actionStr[actionStr.startIndex..<colonIdx])
+            .trimmingCharacters(in: .whitespaces)
+        let actionValue = String(actionStr[actionStr.index(after: colonIdx)...])
+            .trimmingCharacters(in: .whitespaces)
+
+        switch actionType {
+        case "tap":
+            guard let describeResult = describer.describe() else {
+                return "Failed to capture screen for OCR"
+            }
+            guard let match = ElementMatcher.findMatch(label: actionValue,
+                                                         in: describeResult.elements) else {
+                return "Element '\(actionValue)' not found on screen"
+            }
+            return input.tap(x: match.element.tapX, y: match.element.tapY)
+
+        case "launch":
+            return input.launchApp(name: actionValue)
+
+        case "press_key":
+            let result = input.pressKey(keyName: actionValue, modifiers: [])
+            return result.success ? nil : (result.error ?? "Failed to press key")
+
+        default:
+            return "Unknown action type: '\(actionType)'. Use tap, launch, or press_key."
+        }
+    }
+}

@@ -1,0 +1,100 @@
+/*
+ * Copyright 2026 Async-IO.org
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License"); you may not
+ * use this file except in compliance with the License. You may obtain a copy of
+ * the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ */
+// ABOUTME: Registers the scroll_to MCP tool for scrolling until an element becomes visible.
+// ABOUTME: The handler parses arguments; ScrollSeeker scrolls, reads the screen and decides when the content has ended.
+
+import CoreGraphics
+import Foundation
+import HelperLib
+
+extension MirroirMCP {
+    static func registerScrollToTools(
+        server: MCPServer,
+        registry: TargetRegistry
+    ) {
+        // scroll_to — scroll until an element is visible via OCR
+        server.registerTool(MCPToolDefinition(
+            name: "scroll_to",
+            description: """
+                Scroll until a text becomes visible on the mirrored iPhone screen, \
+                reading the screen after each scroll. direction says where the \
+                content you want is: "down" (the default) shows what is further \
+                down the page, "up" what is above, "left" and "right" what is to \
+                that side. It is the opposite of the finger's motion; to move the \
+                finger, use swipe. Stops when the content stops moving \
+                (stop_reason=end_of_content) or the scroll budget is spent \
+                (stop_reason=max_scrolls).
+                """,
+            inputSchema: [
+                "type": .string("object"),
+                "properties": .object([
+                    "label": .object([
+                        "type": .string("string"),
+                        "description": .string("Text to find on screen via OCR"),
+                    ]),
+                    "direction": .object([
+                        "type": .string("string"),
+                        "enum": .array(ScrollDirection.allCases.map { .string($0.rawValue) }),
+                        "description": .string("Where the content you want is (default: down)."),
+                    ]),
+                    "at": .object([
+                        "type": .string("array"),
+                        "description": .string(
+                            "Point [x, y] in window points to scroll at, for a list inside the "
+                            + "screen (a carousel, a sheet). Default: the window centre."),
+                    ]),
+                    "max_scrolls": .object([
+                        "type": .string("integer"),
+                        "description": .string(
+                            "Maximum number of scroll attempts before giving up (default: 10)"),
+                    ]),
+                ]),
+                "required": .array([.string("label")]),
+            ],
+            contextualHandler: { args, context in
+                let (ctx, err) = registry.resolveForTool(args)
+                guard let ctx else { return err! }
+                let bridge = ctx.bridge
+                let input = ctx.input
+                let describer = ctx.ocrDescriber
+
+                guard let label = args["label"]?.asString() else {
+                    return .error("Missing required parameter: label (string)")
+                }
+
+                let directionName = args["direction"]?.asString() ?? ScrollDirection.down.rawValue
+                guard let direction = ScrollDirection(rawValue: directionName.lowercased()) else {
+                    return .error("Unknown direction: \(directionName). Use \(ScrollDirection.names).")
+                }
+                let maxScrolls = args["max_scrolls"]?.asInt() ?? EnvConfig.defaultScrollMaxAttempts
+
+                let anchor: CGPoint?
+                switch ScrollAnchorArgument.parse(args["at"], bridge: bridge) {
+                case .absent: anchor = nil
+                case .point(let point): anchor = point
+                case .invalid(let message): return .error(message)
+                }
+
+                let outcome = ScrollSeeker.seek(
+                    label: label, toward: direction, maxScrolls: maxScrolls, anchor: anchor,
+                    band: ScrollSeeker.band(for: ctx.profile, orientation: bridge.getOrientation()),
+                    bridge: bridge, input: input, describer: describer, call: context.call)
+                let reply = outcome.toolReply(label: label)
+                return reply.isError ? .error(reply.text) : .text(reply.text)
+            }
+        ))
+    }
+}

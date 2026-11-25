@@ -1,0 +1,102 @@
+/*
+ * Copyright 2026 Async-IO.org
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License"); you may not
+ * use this file except in compliance with the License. You may obtain a copy of
+ * the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ */
+// ABOUTME: Structured errors for a `scene:` step — its verdict (failed, inconclusive, unreported) and its decider.
+// ABOUTME: Converts into RunnerError via #[from]; an inconclusive scene is the one error that exits 66.
+
+use std::path::PathBuf;
+
+use thiserror::Error;
+
+use crate::compile::captures::SceneReason;
+
+/// What a `scene:` step concluded, when it was not a pass.
+///
+/// Every variant is a failure of the scenario. [`SceneError::Inconclusive`]
+/// is told apart from the others because the scene proved nothing either way
+/// — its budget ran out first — and a CI lane may want to tell "the game beat
+/// the model" from "the model ran out of money".
+#[derive(Debug, Error)]
+pub enum SceneError {
+    /// The scene's budget ran out before either predicate showed.
+    #[error(
+        "scene step {index} (`{skill}`) is inconclusive: {reason} after {frames} frame(s), {total_tokens} tokens and {seconds:.1}s with `{model}`; neither predicate showed inside the budget"
+    )]
+    Inconclusive {
+        /// Index of the `scene:` step, as the scenario file reads.
+        index: usize,
+        /// The kind:game skill the scene ran.
+        skill: String,
+        /// Which budget field ran out.
+        reason: SceneReason,
+        /// Model calls the scene made.
+        frames: u32,
+        /// Prompt plus completion tokens the scene spent.
+        total_tokens: u64,
+        /// Wall-clock seconds the scene ran.
+        seconds: f64,
+        /// The model the scene's route requested.
+        model: String,
+    },
+
+    /// The fail predicate showed, or the scene could not perceive a frame or
+    /// account for its cost.
+    #[error(
+        "scene step {index} (`{skill}`) failed: {reason} after {frames} frame(s), {total_tokens} tokens and {seconds:.1}s with `{model}`"
+    )]
+    Failed {
+        /// Index of the `scene:` step, as the scenario file reads.
+        index: usize,
+        /// The kind:game skill the scene ran.
+        skill: String,
+        /// Why the scene stopped.
+        reason: SceneReason,
+        /// Model calls the scene made.
+        frames: u32,
+        /// Prompt plus completion tokens the scene spent.
+        total_tokens: u64,
+        /// Wall-clock seconds the scene ran.
+        seconds: f64,
+        /// The model the scene's route requested.
+        model: String,
+    },
+
+    /// The block passed, yet its report carries no entry for this scene. A
+    /// scene with no verdict proved nothing, so the pass is refused.
+    #[error(
+        "scene step {index} (`{skill}`) passed its block but mirroir-mcp reported no verdict for it; a scene with no report is not a pass"
+    )]
+    NotReported {
+        /// Index of the `scene:` step, as the scenario file reads.
+        index: usize,
+        /// The kind:game skill the step names.
+        skill: String,
+    },
+
+    /// A `decider:` that is empty or only whitespace names no program.
+    #[error("a scene `decider:` is blank; name the move picker's program, or drop the key")]
+    BlankDecider,
+
+    /// A relative decider program, joined onto the scenario's directory, is
+    /// not UTF-8 and cannot be written into mirroir-mcp's block text.
+    #[error(
+        "the scene decider resolves to `{}`, which is not UTF-8 and cannot be written into the ios block",
+        path.display()
+    )]
+    DeciderPathNotUtf8 {
+        /// The joined program path.
+        path: PathBuf,
+    },
+}

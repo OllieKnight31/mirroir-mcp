@@ -1,0 +1,329 @@
+/*
+ * Copyright 2026 Async-IO.org
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License"); you may not
+ * use this file except in compliance with the License. You may obtain a copy of
+ * the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ */
+// ABOUTME: Data model for compiled skills — pre-recorded coordinates, timing, and scroll sequences.
+// ABOUTME: Replay acts on these hints and checks each labeled step against the live screen.
+
+import CommonCrypto
+import Foundation
+
+/// A compiled skill ready for replay from its recorded hints.
+struct CompiledSkill: Codable, Equatable {
+    /// Format version for forward compatibility.
+    let version: Int
+    /// Metadata about the source YAML file.
+    let source: SourceInfo
+    /// Device dimensions at compilation time.
+    let device: DeviceInfo
+    /// Pre-compiled steps with cached coordinates and timing.
+    let steps: [CompiledStep]
+    /// OCR-based fingerprint of the screen the skill starts from, captured before its
+    /// first step ran. Every producer (`mirroir-mcp compile`, `save_compiled`,
+    /// `mirroir-mcp test --compiled-out`) records that same moment, so a caller can
+    /// compare it against the screen a run starts on. `mirroir-mcp test` never compares
+    /// it, nor rewrites a compiled file it replays. Nil when no start screen was read.
+    var screenFingerprint: ScreenFingerprint? = nil
+
+    /// Current format version. Bump forces recompilation of all existing compiled skills.
+    /// Version 3: a step's `label` is its replay value, which a SKILL.md's steps are
+    /// rebuilt from, where earlier versions held a free-form display label.
+    /// Version 4: `wait_for` compiles to `passthrough` (it polls the screen live), and
+    /// the `sleep` action, which passed without looking at the screen, is gone.
+    /// Version 5: a tap recorded by coordinates alone carries `arrivalFingerprint`, the
+    /// screen it led to, and replay fails it without one.
+    /// Version 6: a scroll sequence's `scrollDirection` names the content it reveals
+    /// (`down` shows what is below), where earlier versions named the finger's motion.
+    static let currentVersion = 6
+}
+
+/// Structural fingerprint of a screen: the one a compiled skill starts from, or the
+/// one a coordinate-only tap leads to.
+struct ScreenFingerprint: Codable, Equatable {
+    /// SHA-256 of sorted structural texts + icon count for fast-path equality.
+    let hash: String
+    /// Sorted structural text elements for Jaccard comparison when hash differs.
+    let structuralTexts: [String]
+    /// Number of detected icons (coarse structural signal).
+    let iconCount: Int
+}
+
+/// Metadata about the source skill file used to detect staleness.
+struct SourceInfo: Codable, Equatable {
+    /// SHA-256 hash of the source skill file content.
+    let sha256: String
+    /// ISO 8601 timestamp of when the skill was compiled.
+    let compiledAt: String
+}
+
+/// Device dimensions captured during compilation for dimension mismatch detection.
+struct DeviceInfo: Codable, Equatable {
+    let windowWidth: Double
+    let windowHeight: Double
+    let orientation: String
+}
+
+/// A single step in a compiled skill, combining the original step type with cached hints.
+struct CompiledStep: Codable, Equatable {
+    /// Original step index in the skill.
+    let index: Int
+    /// Step type key (e.g. "tap", "wait_for", "launch").
+    let type: String
+    /// Human-readable label from the original step.
+    let label: String?
+    /// Compiled hints for replay. Nil for AI-only steps that cannot be compiled.
+    let hints: StepHints?
+}
+
+/// Cached data from the learning run that compiled replay acts on.
+struct StepHints: Codable, Equatable {
+    /// The action to perform during compiled replay.
+    let compiledAction: CompiledAction
+
+    // Tap hints
+    let tapX: Double?
+    let tapY: Double?
+    let matchStrategy: String?
+
+    // Timing hints
+    let observedDelayMs: Int?
+
+    // Scroll hints
+    let scrollCount: Int?
+    /// A `ScrollDirection` raw value: where the scrolled-to content lies.
+    let scrollDirection: String?
+
+    /// The screen a tap recorded by coordinates alone (an icon with no text) led
+    /// to. Replay has no label to look for before such a tap, so it checks after:
+    /// the screen the tap reaches must match this one.
+    var arrivalFingerprint: ScreenFingerprint? = nil
+
+    /// Create hints for a tap action. `arrival` is the screen a coordinate-only
+    /// tap led to; a labeled tap is checked by its label instead and records none.
+    static func tap(x: Double, y: Double, strategy: String,
+                    arrival: ScreenFingerprint? = nil) -> StepHints {
+        StepHints(compiledAction: .tap, tapX: x, tapY: y,
+                  matchStrategy: strategy,
+                  observedDelayMs: nil, scrollCount: nil, scrollDirection: nil,
+                  arrivalFingerprint: arrival)
+    }
+
+    /// Create hints for an assertion action — sleeps observed delay, then performs real OCR.
+    static func assertion(delayMs: Int) -> StepHints {
+        StepHints(compiledAction: .assertion, tapX: nil, tapY: nil,
+                  matchStrategy: nil,
+                  observedDelayMs: delayMs, scrollCount: nil, scrollDirection: nil)
+    }
+
+    /// Create hints for a scroll sequence.
+    static func scrollSequence(count: Int, direction: String) -> StepHints {
+        StepHints(compiledAction: .scrollSequence, tapX: nil, tapY: nil,
+                  matchStrategy: nil,
+                  observedDelayMs: nil, scrollCount: count, scrollDirection: direction)
+    }
+
+    /// Create hints for a passthrough action: the step runs live through `StepExecutor`.
+    /// `arrival` is the settled screen the step left on display when a run recorded
+    /// it (`mirroir-mcp test --compiled-out`), for a caller comparing a later run's
+    /// screens against it; replay does not read it for a passthrough step.
+    static func passthrough(arrival: ScreenFingerprint? = nil) -> StepHints {
+        StepHints(compiledAction: .passthrough, tapX: nil, tapY: nil,
+                  matchStrategy: nil,
+                  observedDelayMs: nil, scrollCount: nil, scrollDirection: nil,
+                  arrivalFingerprint: arrival)
+    }
+}
+
+/// The type of action to perform during compiled replay.
+enum CompiledAction: String, Codable, Equatable {
+    /// Tap at cached coordinates once OCR finds a labeled step's element there; an
+    /// element found elsewhere is tapped where it is, one not found fails the step.
+    case tap
+    /// Sleep observed delay then delegate to normal StepExecutor for real OCR assertion.
+    case assertion
+    /// Replay a sequence of scroll/swipe gestures, then require the target on screen.
+    case scrollSequence = "scroll_sequence"
+    /// Delegate to normal StepExecutor, which runs the step live.
+    case passthrough
+}
+
+/// File I/O for compiled skill JSON files.
+enum CompiledSkillIO {
+
+    /// Derive the compiled JSON path from a skill file path.
+    /// Works for both `.yaml` and `.md` since `deletingPathExtension` handles either.
+    /// `apps/settings/check-about.yaml` → `apps/settings/check-about.compiled.json`
+    /// `apps/settings/check-about.md` → `apps/settings/check-about.compiled.json`
+    static func compiledPath(for skillPath: String) -> String {
+        let base = (skillPath as NSString).deletingPathExtension
+        return base + ".compiled.json"
+    }
+
+    /// Load a compiled skill from disk. Returns nil if file doesn't exist.
+    static func load(for skillPath: String) throws -> CompiledSkill? {
+        let path = compiledPath(for: skillPath)
+        guard FileManager.default.fileExists(atPath: path) else { return nil }
+
+        let data = try Data(contentsOf: URL(fileURLWithPath: path))
+        let decoder = JSONDecoder()
+        let decoded = try decoder.decode(CompiledSkill.self, from: data)
+        return CompiledSkill(
+            version: decoded.version, source: decoded.source, device: decoded.device,
+            steps: normalizedSteps(decoded.steps),
+            screenFingerprint: decoded.screenFingerprint)
+    }
+
+    /// Compiled steps in step order, one per index. Replay pairs the i-th step of a
+    /// skill with the i-th compiled step, but an AI can record steps out of order or
+    /// record a retried step twice; the last record of an index is the one that ran.
+    static func normalizedSteps(_ steps: [CompiledStep]) -> [CompiledStep] {
+        var latest: [Int: CompiledStep] = [:]
+        for step in steps {
+            latest[step.index] = step
+        }
+        return latest.keys.sorted().compactMap { latest[$0] }
+    }
+
+    /// The SKILL.md beside a YAML skill whose recorded steps fill the compiled file both
+    /// share (`foo.md` and `foo.yaml` both map to `foo.compiled.json`), or nil. Compiling
+    /// the YAML would overwrite the only replayable copy of the SKILL.md's steps.
+    static func skillMdTwinOwningCompiledFile(for skillPath: String) -> String? {
+        guard !skillPath.hasSuffix(".md") else { return nil }
+        let twin = (skillPath as NSString).deletingPathExtension + ".md"
+        guard FileManager.default.fileExists(atPath: twin),
+              let compiled = try? load(for: skillPath),
+              sourceStaleness(compiled: compiled, skillPath: twin) == nil else { return nil }
+        return twin
+    }
+
+    /// Step indices missing from `steps` (already normalized) between 0 and the last
+    /// recorded index. Replay pairs steps by position, so a gap would shift every later
+    /// step onto the wrong hints.
+    /// Gaps are returned as ranges, so a huge recorded index costs nothing to report.
+    static func missingIndices(_ steps: [CompiledStep]) -> [ClosedRange<Int>] {
+        var gaps: [ClosedRange<Int>] = []
+        var expected = 0
+        for index in Set(steps.map(\.index)).sorted() where index >= 0 {
+            if index > expected {
+                gaps.append(expected...(index - 1))
+            }
+            // The largest index has no successor to expect.
+            guard index < Int.max else { break }
+            expected = index + 1
+        }
+        return gaps
+    }
+
+    /// Gaps as `1` or `3...7`, comma-separated, for an error message.
+    static func describe(_ gaps: [ClosedRange<Int>]) -> String {
+        gaps.map { $0.count == 1 ? "\($0.lowerBound)" : "\($0.lowerBound)...\($0.upperBound)" }
+            .joined(separator: ", ")
+    }
+
+    /// Recorded indices below 0, which no step of a skill can have.
+    static func negativeIndices(_ steps: [CompiledStep]) -> [Int] {
+        steps.map(\.index).filter { $0 < 0 }.sorted()
+    }
+
+    /// Why a compiled skill no longer matches its source file, or nil when it does:
+    /// a different compiled-format version, or a source file edited since it was
+    /// compiled. Window size is judged separately, against a device.
+    static func sourceStaleness(compiled: CompiledSkill, skillPath: String) -> String? {
+        if compiled.version != CompiledSkill.currentVersion {
+            return versionMismatch(compiled.version)
+        }
+        if let currentHash = try? sha256(of: skillPath),
+           currentHash != compiled.source.sha256 {
+            return "source file has changed since compilation"
+        }
+        return nil
+    }
+
+    /// Why a compiled file that exists did not decode. A file whose `version` still
+    /// reads is named by that version, exactly as `sourceStaleness` names a version
+    /// mismatch: an older format need not decode under the current shape (a version 3
+    /// file can hold a `sleep` action version 4 no longer has).
+    static func unreadableStaleness(skillPath: String, error: any Error) -> String {
+        if let data = try? Data(contentsOf: URL(fileURLWithPath: compiledPath(for: skillPath))),
+           let probe = try? JSONDecoder().decode(VersionProbe.self, from: data),
+           probe.version != CompiledSkill.currentVersion {
+            return versionMismatch(probe.version)
+        }
+        return "compiled file cannot be decoded (\(error.localizedDescription))"
+    }
+
+    /// The staleness reason for a compiled file written in another format version.
+    private static func versionMismatch(_ version: Int) -> String {
+        "compiled version \(version) != current \(CompiledSkill.currentVersion)"
+    }
+
+    /// The one field every compiled-format version shares.
+    private struct VersionProbe: Decodable {
+        let version: Int
+    }
+
+    /// Save a compiled skill to disk alongside its source file.
+    static func save(_ compiled: CompiledSkill, for skillPath: String) throws {
+        try save(compiled, toPath: compiledPath(for: skillPath))
+    }
+
+    /// Save a compiled skill to exactly `path`, for a caller that names the file
+    /// itself rather than deriving it from a skill path.
+    static func save(_ compiled: CompiledSkill, toPath path: String) throws {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        let data = try encoder.encode(compiled)
+        try data.write(to: URL(fileURLWithPath: path), options: .atomic)
+    }
+
+    /// Compute SHA-256 hash of file contents.
+    static func sha256(of filePath: String) throws -> String {
+        let data = try Data(contentsOf: URL(fileURLWithPath: filePath))
+        return sha256(data: data)
+    }
+
+    /// Compute SHA-256 hash of raw data.
+    static func sha256(data: Data) -> String {
+        var digest = [UInt8](repeating: 0, count: Int(CC_SHA256_DIGEST_LENGTH))
+        data.withUnsafeBytes { buffer in
+            _ = CC_SHA256(buffer.baseAddress, CC_LONG(buffer.count), &digest)
+        }
+        return digest.map { String(format: "%02x", $0) }.joined()
+    }
+
+    /// Check if a compiled skill is stale relative to its source file and the
+    /// window it would replay in. Reading a compiled skill never writes it.
+    static func checkStaleness(compiled: CompiledSkill,
+                                skillPath: String,
+                                windowWidth: Double,
+                                windowHeight: Double) -> StalenessResult {
+        if let reason = sourceStaleness(compiled: compiled, skillPath: skillPath) {
+            return .stale(reason: reason)
+        }
+
+        // Dimension check
+        if compiled.device.windowWidth != windowWidth ||
+           compiled.device.windowHeight != windowHeight {
+            return .stale(reason: "window dimensions changed: compiled \(Int(compiled.device.windowWidth))x\(Int(compiled.device.windowHeight)) vs current \(Int(windowWidth))x\(Int(windowHeight))")
+        }
+
+        return .fresh
+    }
+}
+
+/// Result of staleness checking.
+enum StalenessResult: Equatable {
+    case fresh
+    case stale(reason: String)
+}

@@ -1,0 +1,173 @@
+# ABOUTME: Cargo manifest for the mirroir-run binary — cross-platform YAML replayer.
+# ABOUTME: Reads mirroir SkillStep YAML, drives web/process/http targets, judges via LLM oracle.
+
+[package]
+name = "mirroir-run"
+version = "0.5.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Cross-platform replayer for mirroir SkillStep YAML scenarios — drives web (Chrome via CDP, Firefox/WebKit via WebDriver), generic process, and HTTP targets."
+repository = "https://github.com/OllieKnight31/mirroir-mcp"
+readme = "README.md"
+# Policy floor: track current stable. The code's *technical* minimum is 1.88
+# (where `if let … && let …` let-chains stabilized), but we standardize on the
+# latest stable release rather than supporting older toolchains.
+rust-version = "1.99"
+keywords = ["testing", "e2e", "playwright", "scenario", "automation"]
+categories = ["development-tools::testing", "command-line-utilities"]
+# Ship a lean binary crate: source + README + license only. Dev/CI fixtures
+# (samples/, docs/, scripts/, deny.toml, clippy.toml) are not part of the crate.
+include = ["src/**", "README.md", "LICENSE"]
+
+[[bin]]
+name = "mirroir-run"
+path = "src/main.rs"
+
+[dependencies]
+base64 = "0.23"
+clap = { version = "4", features = ["derive", "env"] }
+hex = "0.4"
+jiff = { version = "1.0.2", default-features = false, features = ["std", "serde"] }
+regex = "1"
+# `rustls-no-provider` keeps aws-lc-rs out of the build; src/tls.rs hands every client a
+# rustls config built on the ring provider and the bundled Mozilla roots.
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+serde = { version = "1", features = ["derive"] }
+serde_ignored = "0.1"
+serde_json = "1"
+serde_norway = "0.9"
+sha2 = "0.11"
+shell-words = "1"
+tempfile = "3"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+# `attributes` (#[instrument]) is unused; leaving it off keeps tracing-attributes, and
+# with it the last syn 2 proc-macro, out of the build.
+tracing = { version = "0.1", default-features = false, features = ["std"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+webpki-roots = "1"
+
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.31", default-features = false, features = ["signal"] }
+
+# Note: anyhow is intentionally NOT a dependency. All fallible operations
+# return `crate::error::Result<T>` backed by the structured `RunnerError`
+# thiserror enum. The `anyhow!()` macro is forbidden and `clippy.toml`
+# disallows `anyhow::Context`.
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 16
+panic = "abort"
+strip = true
+
+[profile.release-lto]
+inherits = "release"
+lto = "fat"
+
+# ============================================================================
+# Lint Configuration
+# ============================================================================
+# ZERO TOLERANCE ENFORCEMENT
+# cargo clippy reads this table and applies level = "deny" — every clippy
+# warning is an ERROR. Compatible with the strict-Rust posture other binaries
+# in this ecosystem apply; one set of rules everywhere.
+
+[lints.rust]
+# STRICT UNSAFE CODE POLICY: zero tolerance with whitelisted exceptions.
+# - "deny" level: unsafe code is an ERROR by default everywhere.
+# - mirroir-run has NO FFI surface (unlike dravr's health.rs Windows FFI), so
+#   there is no approved exception — any unsafe usage FAILS the build.
+unsafe_code = "deny"
+
+# Warn on missing documentation for public APIs.
+missing_docs = "warn"
+
+[lints.clippy]
+# Base configuration: enable all clippy lint groups at DENY level (zero tolerance).
+# Priority -1 ensures these are applied first, then specific overrides below.
+# All clippy warnings are treated as ERRORS via level = "deny".
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+nursery = { level = "deny", priority = -1 }
+
+# ============================================================================
+# Critical Denials - Error Handling Anti-Patterns (AGENTS.md enforcement)
+# ============================================================================
+# These replace the bash script's error handling pattern detection.
+
+# DENY: .unwrap() in production code (acceptable in tests only).
+unwrap_used = "deny"
+
+# DENY: .expect() in production code (acceptable in tests only).
+expect_used = "deny"
+
+# DENY: panic!() in production code (only acceptable in tests).
+panic = "deny"
+
+# DENY: todo!() / unimplemented!() anywhere — every reachable path returns a
+# typed Result.
+todo = "deny"
+unimplemented = "deny"
+
+# ============================================================================
+# Allowed Exceptions (Per AGENTS.md Policy)
+# ============================================================================
+# Type conversion casts - allowed when properly validated.
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+cast_precision_loss = "allow"
+
+# Const fn suggestions - clippy suggests const for methods that can't actually be const
+# (e.g., methods using .to_lowercase(), .map_or(), Utc::now(), etc.).
+missing_const_for_fn = "allow"
+
+# Structural patterns - validated separately.
+struct_excessive_bools = "allow"
+
+# Long functions - allowed with mandatory documentation comment.
+too_many_lines = "allow"
+
+# Significant drop tightening - false positives with async lock guards;
+# the suggestions given are often syntactically invalid.
+significant_drop_tightening = "allow"
+
+# Cognitive complexity - deny on overly complex functions.
+# Enforces the AGENTS.md guideline of small, focused functions.
+cognitive_complexity = "deny"
+
+# ============================================================================
+# Additional Code Quality Lints
+# ============================================================================
+# Catch common performance issues.
+clone_on_copy = "warn"
+redundant_clone = "warn"
+
+# Catch async anti-patterns.
+await_holding_lock = "warn"
+
+# Catch string allocation inefficiencies.
+str_to_string = "deny"
+
+# Module naming - allow repetition for clarity (e.g., error::ErrorKind).
+module_name_repetitions = "allow"
+
+# ============================================================================
+# Rust Idiom Enforcement (Prevent AI-generated regressions)
+# ============================================================================
+# Enforce modern format string syntax: format!("{foo}") not format!("{}", foo).
+uninlined_format_args = "warn"
+
+# Warn on .map().unwrap_or() - should use map_or() or is_some_and() instead.
+map_unwrap_or = "warn"
+
+# Enforce `use` imports over inline qualified paths (crate::foo::bar).
+absolute_paths = "deny"
+
+# Disallow anyhow::Context methods - use structured RunnerError variants instead.
+# Configuration in clippy.toml specifies which methods are banned.
+disallowed_methods = "deny"

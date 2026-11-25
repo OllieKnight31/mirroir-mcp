@@ -1,0 +1,230 @@
+#!/bin/bash
+# ABOUTME: Pre-commit hook for Swift code quality enforcement
+# ABOUTME: Checks license headers, ABOUTME headers, suspicious files, swift build, and MCP compliance
+
+set -e
+
+# Check that Swift and Rust source files open with the Async-IO Apache 2.0 license block
+check_license_headers() {
+    local missing_headers=""
+
+    # Get staged Swift and Rust files (added or modified)
+    local source_files=$(git diff --cached --name-only --diff-filter=ACM | grep -E '\.(swift|rs)$' | grep -v 'Package.swift' || true)
+
+    for file in $source_files; do
+        if [ -f "$file" ]; then
+            if ! sed -n '2p' "$file" | grep -q "^ \* Copyright .*Async-IO.org"; then
+                missing_headers="$missing_headers\n  - $file"
+            fi
+        fi
+    done
+
+    if [ -n "$missing_headers" ]; then
+        echo "ERROR: Commit blocked - Missing Apache 2.0 license headers:"
+        echo -e "$missing_headers"
+        echo ""
+        echo "All Swift and Rust files must start with the Async-IO license block:"
+        echo "  /*"
+        echo "   * Copyright 2026 Async-IO.org"
+        echo "   *"
+        echo "   * Licensed under the Apache License, Version 2.0 (the \"License\"); ..."
+        echo "   */"
+        return 1
+    fi
+    return 0
+}
+
+# Check that Swift source files have ABOUTME headers
+check_aboutme_headers() {
+    local missing_headers=""
+
+    # Get staged Swift files (added or modified)
+    local swift_files=$(git diff --cached --name-only --diff-filter=ACM | grep -E '\.swift$' | grep -v '/Tests/' | grep -v 'Package.swift' || true)
+
+    for file in $swift_files; do
+        if [ -f "$file" ]; then
+            # ABOUTME follows the 15-line license block
+            if ! head -20 "$file" | grep -q "ABOUTME:"; then
+                missing_headers="$missing_headers\n  - $file"
+            fi
+        fi
+    done
+
+    if [ -n "$missing_headers" ]; then
+        echo "ERROR: Commit blocked - Missing ABOUTME headers:"
+        echo -e "$missing_headers"
+        echo ""
+        echo "All Swift source files must have a 2-line ABOUTME comment right after the license block. Format:"
+        echo "  // ABOUTME: Brief description of what this file does."
+        echo "  // ABOUTME: Additional context about the file's purpose."
+        return 1
+    fi
+    return 0
+}
+
+# Check that staged Rust source files under runner/src have ABOUTME headers
+# on the two lines right after the license block.
+check_rust_aboutme_headers() {
+    local missing_headers=""
+
+    # Get staged Rust files (added or modified) under runner/src.
+    local rust_files=$(git diff --cached --name-only --diff-filter=ACM | grep -E '^runner/src/.*\.rs$' || true)
+
+    for file in $rust_files; do
+        if [ -f "$file" ]; then
+            # The two lines after the license block's closing " */" must each carry an ABOUTME marker.
+            local first_line=$(( $(grep -n -m1 '^ \*/$' "$file" | cut -d: -f1) + 1 ))
+            if ! sed -n "${first_line}p" "$file" | grep -q "ABOUTME:" || ! sed -n "$((first_line + 1))p" "$file" | grep -q "ABOUTME:"; then
+                missing_headers="$missing_headers\n  - $file"
+            fi
+        fi
+    done
+
+    if [ -n "$missing_headers" ]; then
+        echo "ERROR: Commit blocked - Missing Rust ABOUTME headers:"
+        echo -e "$missing_headers"
+        echo ""
+        echo "All runner/src Rust files must have a 2-line ABOUTME comment right after the license block. Format:"
+        echo "  // ABOUTME: Brief description of what this file does."
+        echo "  // ABOUTME: Additional context about the file's purpose."
+        return 1
+    fi
+    return 0
+}
+
+# Check for files with suspicious patterns (backups, old files, etc.)
+check_suspicious_files() {
+    local suspicious_files=$(git diff --cached --name-only --diff-filter=ACM | grep -E '\.(bak|orig|tmp|swp)$|_old\.|old_|\.old\.' || true)
+
+    if [ -n "$suspicious_files" ]; then
+        echo "ERROR: Commit blocked - Found suspicious files:"
+        echo "$suspicious_files" | sed 's/^/  - /'
+        echo ""
+        echo "These files appear to be backups or old versions."
+        echo "Please remove them or rename them before committing."
+        return 1
+    fi
+    return 0
+}
+
+# Check that staged Swift files compile
+check_swift_build() {
+    local swift_files=$(git diff --cached --name-only --diff-filter=ACM | grep -E '\.swift$' || true)
+
+    if [ -n "$swift_files" ]; then
+        echo "Running swift build..."
+        if ! swift build 2>&1; then
+            echo ""
+            echo "ERROR: Commit blocked - swift build failed!"
+            echo "Please fix compilation errors before committing."
+            return 1
+        fi
+        echo "Swift build passed"
+    fi
+    return 0
+}
+
+# Run MCP compliance validation when MCP-related files are changed
+check_mcp_compliance() {
+    local mcp_files=$(git diff --cached --name-only --diff-filter=ACM | grep -E '(MCPServer|Tool|protocol|MCP)' || true)
+
+    if [ -n "$mcp_files" ]; then
+        echo "MCP-related files changed - running MCP compliance validation..."
+
+        # Reuse the debug binary already built by check_swift_build
+        local BINARY=".build/debug/mirroir-mcp"
+        if [ ! -x "$BINARY" ]; then
+            echo "WARNING: Debug binary not found, skipping MCP compliance check"
+            return 0
+        fi
+
+        # Quick MCP protocol version check, both eras: server/discover leads with
+        # the newest (stateless) revision; initialize negotiates the newest
+        # initialize-era one.
+        local VERSION_RESULT
+        VERSION_RESULT=$(printf '%s\n' \
+            '{"jsonrpc":"2.0","id":1,"method":"server/discover","params":{}}' \
+            '{"jsonrpc":"2.0","id":2,"method":"initialize","params":{}}' \
+            | $BINARY 2>/dev/null | head -2)
+
+        if ! echo "$VERSION_RESULT" | python3 -c "
+import sys, json
+discover = json.loads(sys.stdin.readline())
+initialize = json.loads(sys.stdin.readline())
+assert discover['result']['supportedVersions'][0] == '2026-07-28', \
+    f'server/discover must lead with 2026-07-28, got: {discover[\"result\"][\"supportedVersions\"]}'
+assert initialize['result']['protocolVersion'] == '2025-11-25', \
+    f'initialize must negotiate 2025-11-25, got: {initialize[\"result\"][\"protocolVersion\"]}'
+assert initialize['result']['serverInfo']['name'] == 'mirroir-mcp'
+assert initialize.get('jsonrpc') == '2.0'
+print('OK')
+" 2>&1 | grep -q "OK"; then
+            echo ""
+            echo "ERROR: Commit blocked - MCP protocol compliance failed!"
+            echo "server/discover must lead with 2026-07-28 (latest MCP spec), and initialize must negotiate 2025-11-25."
+            return 1
+        fi
+
+        # Quick tools/list validation
+        local TOOLS_RESULT
+        TOOLS_RESULT=$(printf '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}\n{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}\n' \
+            | $BINARY --dangerously-skip-permissions 2>/dev/null | tail -1)
+
+        if ! echo "$TOOLS_RESULT" | python3 -c "
+import sys, json
+obj = json.loads(sys.stdin.readline())
+tools = obj['result']['tools']
+for t in tools:
+    assert 'name' in t, 'Tool missing name'
+    assert 'description' in t, f'{t[\"name\"]}: missing description'
+    assert 'inputSchema' in t, f'{t[\"name\"]}: missing inputSchema'
+print('OK')
+" 2>&1 | grep -q "OK"; then
+            echo ""
+            echo "ERROR: Commit blocked - Tool schema validation failed!"
+            echo "All tools must have name, description, and inputSchema fields."
+            return 1
+        fi
+
+        echo "MCP compliance check passed"
+    fi
+    return 0
+}
+
+# Main execution
+main() {
+    local checks_passed=true
+
+    if ! check_license_headers; then
+        checks_passed=false
+    fi
+
+    if ! check_aboutme_headers; then
+        checks_passed=false
+    fi
+
+    if ! check_rust_aboutme_headers; then
+        checks_passed=false
+    fi
+
+    if ! check_suspicious_files; then
+        checks_passed=false
+    fi
+
+    if ! check_swift_build; then
+        checks_passed=false
+    fi
+
+    if ! check_mcp_compliance; then
+        checks_passed=false
+    fi
+
+    if [ "$checks_passed" = false ]; then
+        exit 1
+    fi
+
+    echo "All pre-commit checks passed"
+    exit 0
+}
+
+main "$@"

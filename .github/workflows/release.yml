@@ -1,0 +1,446 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release (e.g. 0.22.0)'
+        required: true
+        type: string
+
+jobs:
+  # FakeMirroring's integration suite, on the macOS the Build workflow proves
+  # it on. On the hosted macOS 26 runner (a virtual machine, macOS 26.7) typed
+  # text does not reach FakeMirroring (carnet#65), so the suite gates the
+  # release from here while the release itself builds with the macOS 26 SDK.
+  integration:
+    runs-on: macos-15
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: ./.github/actions/setup-embacle
+
+      - name: Clone skills repo
+        run: |
+          git clone https://github.com/jfarcand/mirroir-skills.git ../mirroir-skills
+          mkdir -p .mirroir-mcp
+          ln -s "$(cd ../mirroir-skills && pwd)" .mirroir-mcp/skills
+
+      - name: Build release
+        run: swift build -c release
+
+      - uses: ./.github/actions/setup-fake-mirroring
+      - name: Integration tests (FakeMirroring)
+        env:
+          MIRROIR_BUNDLE_ID: com.jfarcand.FakeMirroring
+        run: swift test --filter IntegrationTests
+
+  release:
+    needs: integration
+    # The macOS 26 SDK carries SpeechAnalyzer, which `listen` needs: a binary
+    # built with an older SDK compiles it out. The deployment target stays
+    # macOS 14, so the binary still runs there, with listen refusing.
+    runs-on: macos-26
+    permissions:
+      contents: write
+    steps:
+      - name: Require dispatch from the default branch
+        env:
+          DISPATCH_REF: ${{ github.ref }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          if [ -z "$DEFAULT_BRANCH" ]; then
+            echo "::error::Could not resolve the repository default branch from the event payload"
+            exit 1
+          fi
+          if [ "$DISPATCH_REF" != "refs/heads/$DEFAULT_BRANCH" ]; then
+            echo "::error::Release must be dispatched from '$DEFAULT_BRANCH', but this run is on '$DISPATCH_REF'"
+            echo "The version bump is committed on the checkout and later put on \$DEFAULT_BRANCH,"
+            echo "which only fits when the checkout is that branch. Re-run this workflow from \$DEFAULT_BRANCH."
+            exit 1
+          fi
+          echo "Dispatched from '$DEFAULT_BRANCH' - proceeding."
+
+      - name: Validate version format
+        env:
+          VERSION: ${{ github.event.inputs.version }}
+        run: |
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "ERROR: Version must match X.Y.Z (got '$VERSION')"
+            exit 1
+          fi
+
+      - uses: actions/checkout@v7
+        with:
+          token: ${{ secrets.RELEASE_PAT }}
+          fetch-depth: 0
+
+      - uses: ./.github/actions/setup-embacle
+
+      - name: Determine current version
+        id: current
+        run: |
+          OLD=$(python3 -c "import json; print(json.load(open('server.json'))['version'])")
+          echo "version=$OLD" >> "$GITHUB_OUTPUT"
+
+      - name: Guard against duplicate release
+        env:
+          VERSION: ${{ github.event.inputs.version }}
+          OLD_VERSION: ${{ steps.current.outputs.version }}
+        run: |
+          if [ "$OLD_VERSION" = "$VERSION" ]; then
+            echo "ERROR: Version $VERSION is already the current version"
+            exit 1
+          fi
+          if git rev-parse "v$VERSION" >/dev/null 2>&1; then
+            echo "ERROR: Tag v$VERSION already exists"
+            exit 1
+          fi
+
+      - name: Bump version in mirroir-mcp files
+        env:
+          VERSION: ${{ github.event.inputs.version }}
+          OLD_VERSION: ${{ steps.current.outputs.version }}
+        run: |
+          sed -i '' "s/\"version\": \"$OLD_VERSION\"/\"version\": \"$VERSION\"/" npm/package.json
+          sed -i '' "s/const VERSION = \"$OLD_VERSION\"/const VERSION = \"$VERSION\"/" npm/install.js
+          sed -i '' "s/\"version\": \"$OLD_VERSION\"/\"version\": \"$VERSION\"/g" server.json
+          sed -i '' "s/static let current = \"$OLD_VERSION\"/static let current = \"$VERSION\"/" Sources/mirroir-mcp/Version.swift
+          sed -i '' "s/\"version\": \"$OLD_VERSION\"/\"version\": \"$VERSION\"/" mcpb/manifest.json plugins/mirroir/.claude-plugin/plugin.json plugins/hermes/plugin.json plugins/openclaw/openclaw.plugin.json plugins/openclaw/package.json
+          sed -i '' "s/mirroir-mcp@$OLD_VERSION/mirroir-mcp@$VERSION/" plugins/mirroir/.claude-plugin/plugin.json plugins/hermes/mcp.json plugins/openclaw/openclaw.plugin.json
+
+      - name: Verify no stale version references
+        env:
+          OLD_VERSION: ${{ steps.current.outputs.version }}
+        run: |
+          FILES="npm/package.json npm/install.js server.json Sources/mirroir-mcp/Version.swift mcpb/manifest.json plugins/mirroir/.claude-plugin/plugin.json plugins/hermes/plugin.json plugins/hermes/mcp.json plugins/openclaw/openclaw.plugin.json plugins/openclaw/package.json"
+          if grep -l "$OLD_VERSION" $FILES; then
+            echo "ERROR: Stale version references remain in the files above"
+            exit 1
+          fi
+
+      - name: Clone skills repo
+        run: |
+          git clone https://github.com/jfarcand/mirroir-skills.git ../mirroir-skills
+          mkdir -p .mirroir-mcp
+          ln -s "$(cd ../mirroir-skills && pwd)" .mirroir-mcp/skills
+
+      - name: Build release
+        run: swift build -c release
+
+      - name: Run tests (XCTest)
+        timeout-minutes: 15
+        run: scripts/unit-tests.sh xctest
+
+      - name: Run tests (Swift Testing)
+        timeout-minutes: 5
+        run: scripts/unit-tests.sh swift-testing
+
+      # The bump commit carries the plugin's npx pin (mirroir-mcp@<version>), and
+      # a plugin installed from main resolves that pin on npm. So the commit is
+      # pushed as the release tag only; push-version-to-main puts it on main once
+      # npm serves the version. Version and pin change in this one commit, so
+      # server.json and plugin.json agree on every commit main ever holds.
+      - name: Commit version bump and tag it
+        env:
+          VERSION: ${{ github.event.inputs.version }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add npm/package.json npm/install.js server.json \
+            Sources/mirroir-mcp/Version.swift \
+            mcpb/manifest.json plugins/mirroir/.claude-plugin/plugin.json \
+            plugins/hermes/plugin.json plugins/hermes/mcp.json \
+            plugins/openclaw/openclaw.plugin.json plugins/openclaw/package.json
+          git commit -m "chore: bump version to $VERSION"
+          git push origin "HEAD:refs/tags/v$VERSION"
+
+      - name: Create tarball and checksum
+        run: |
+          # arm64 (Apple Silicon) — built by the earlier `swift build -c release`.
+          # No x86_64 (Intel) binary: embacle-ffi is arm64-only, so an x86_64
+          # build cannot link the embacle symbols. Universal support needs a
+          # universal embacle-ffi (tracked separately).
+          cd .build/release
+          tar czf "$GITHUB_WORKSPACE/mirroir-mcp-darwin-arm64.tar.gz" mirroir-mcp
+          cd "$GITHUB_WORKSPACE"
+          mcpb/build-mcpb.sh .build/release/mirroir-mcp mirroir-mcp.mcpb
+          shasum -a 256 mirroir-mcp-darwin-arm64.tar.gz mirroir-mcp.mcpb > SHA256SUMS
+
+      - name: Generate release notes
+        env:
+          VERSION: ${{ github.event.inputs.version }}
+        run: |
+          PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
+          if [ -z "$PREV_TAG" ]; then
+            RANGE="HEAD"
+          else
+            RANGE="${PREV_TAG}..HEAD"
+          fi
+
+          echo "## What's Changed" > release-notes.md
+          echo "" >> release-notes.md
+
+          # Collect commits by type (two-pass sed: first handles scoped, second handles unscoped)
+          FEATS=$(git log "$RANGE" --pretty=format:"%s" | grep -E "^feat(\(.*\))?:" | sed 's/^feat(\([^)]*\)): /- **\1:** /' | sed 's/^feat: /- /' || true)
+          FIXES=$(git log "$RANGE" --pretty=format:"%s" | grep -E "^fix(\(.*\))?:" | sed 's/^fix(\([^)]*\)): /- **\1:** /' | sed 's/^fix: /- /' || true)
+          PERFS=$(git log "$RANGE" --pretty=format:"%s" | grep -E "^perf(\(.*\))?:" | sed 's/^perf(\([^)]*\)): /- **\1:** /' | sed 's/^perf: /- /' || true)
+          DOCS=$(git log "$RANGE" --pretty=format:"%s" | grep -E "^docs(\(.*\))?:" | sed 's/^docs(\([^)]*\)): /- **\1:** /' | sed 's/^docs: /- /' || true)
+          REFACTORS=$(git log "$RANGE" --pretty=format:"%s" | grep -E "^refactor(\(.*\))?:" | sed 's/^refactor(\([^)]*\)): /- **\1:** /' | sed 's/^refactor: /- /' || true)
+          CHORES=$(git log "$RANGE" --pretty=format:"%s" | grep -E "^chore(\(.*\))?:" | sed 's/^chore(\([^)]*\)): /- **\1:** /' | sed 's/^chore: /- /' || true)
+          CI=$(git log "$RANGE" --pretty=format:"%s" | grep -E "^ci(\(.*\))?:" | sed 's/^ci(\([^)]*\)): /- **\1:** /' | sed 's/^ci: /- /' || true)
+
+          if [ -n "$FEATS" ]; then
+            echo "### Features" >> release-notes.md
+            echo "$FEATS" >> release-notes.md
+            echo "" >> release-notes.md
+          fi
+          if [ -n "$FIXES" ]; then
+            echo "### Bug Fixes" >> release-notes.md
+            echo "$FIXES" >> release-notes.md
+            echo "" >> release-notes.md
+          fi
+          if [ -n "$PERFS" ]; then
+            echo "### Performance" >> release-notes.md
+            echo "$PERFS" >> release-notes.md
+            echo "" >> release-notes.md
+          fi
+          if [ -n "$DOCS" ]; then
+            echo "### Documentation" >> release-notes.md
+            echo "$DOCS" >> release-notes.md
+            echo "" >> release-notes.md
+          fi
+          if [ -n "$REFACTORS" ]; then
+            echo "### Refactoring" >> release-notes.md
+            echo "$REFACTORS" >> release-notes.md
+            echo "" >> release-notes.md
+          fi
+          if [ -n "$CHORES" ]; then
+            echo "### Chores" >> release-notes.md
+            echo "$CHORES" >> release-notes.md
+            echo "" >> release-notes.md
+          fi
+          if [ -n "$CI" ]; then
+            echo "### CI" >> release-notes.md
+            echo "$CI" >> release-notes.md
+            echo "" >> release-notes.md
+          fi
+
+          echo "**Full Changelog**: https://github.com/${{ github.repository }}/compare/${PREV_TAG}...v${VERSION}" >> release-notes.md
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ github.event.inputs.version }}
+        run: |
+          gh release create "v$VERSION" \
+            mirroir-mcp-darwin-arm64.tar.gz \
+            mirroir-mcp.mcpb \
+            SHA256SUMS \
+            --title "v$VERSION" \
+            --notes-file release-notes.md
+
+  update-homebrew:
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout homebrew-tap
+        uses: actions/checkout@v7
+        with:
+          repository: jfarcand/homebrew-tap
+          token: ${{ secrets.RELEASE_PAT }}
+
+      - name: Download source tarball and compute SHA256
+        env:
+          VERSION: ${{ github.event.inputs.version }}
+        run: |
+          curl -sL "https://github.com/OllieKnight31/mirroir-mcp/archive/refs/tags/v${VERSION}.tar.gz" -o /tmp/source.tar.gz
+          echo "SHA=$(sha256sum /tmp/source.tar.gz | cut -d' ' -f1)" >> "$GITHUB_ENV"
+
+      - name: Update Formula
+        env:
+          VERSION: ${{ github.event.inputs.version }}
+        run: |
+          sed -i "s|url \"https://github.com/OllieKnight31/mirroir-mcp/archive/refs/tags/v.*\.tar\.gz\"|url \"https://github.com/OllieKnight31/mirroir-mcp/archive/refs/tags/v${VERSION}.tar.gz\"|" Formula/mirroir-mcp.rb
+          sed -i "s/sha256 \"[a-f0-9]\{64\}\"/sha256 \"${SHA}\"/" Formula/mirroir-mcp.rb
+
+      - name: Update index.md
+        env:
+          VERSION: ${{ github.event.inputs.version }}
+        run: |
+          sed -i "s/| [0-9]\+\.[0-9]\+\.[0-9]\+ |/| ${VERSION} |/" index.md
+
+      - name: Commit and push
+        env:
+          VERSION: ${{ github.event.inputs.version }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/mirroir-mcp.rb index.md
+          git commit -m "chore: bump mirroir-mcp to ${VERSION}"
+          git push
+
+  update-skills:
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout mirroir-skills
+        uses: actions/checkout@v7
+        with:
+          repository: jfarcand/mirroir-skills
+          token: ${{ secrets.RELEASE_PAT }}
+          fetch-depth: 0
+
+      - name: Bump version in the Copilot marketplace.json
+        env:
+          VERSION: ${{ github.event.inputs.version }}
+        run: |
+          sed -i "s/\"version\": \"[0-9]\+\.[0-9]\+\.[0-9]\+\"/\"version\": \"${VERSION}\"/g" \
+            .github/plugin/marketplace.json
+
+      - name: Commit, tag, and release
+        env:
+          VERSION: ${{ github.event.inputs.version }}
+          GH_TOKEN: ${{ secrets.RELEASE_PAT }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .github/plugin/marketplace.json
+          git commit -m "chore: bump version to ${VERSION}"
+          git push
+          git tag "v${VERSION}"
+          git push origin "v${VERSION}"
+
+          # Generate changelog from conventional commits since previous tag
+          PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
+          if [ -n "$PREV_TAG" ]; then
+            RANGE="${PREV_TAG}..HEAD"
+          else
+            RANGE="HEAD"
+          fi
+
+          NOTES="## What's Changed\n\n"
+          for TYPE_HEADER in "feat:Features" "fix:Bug Fixes" "docs:Documentation" "chore:Chores"; do
+            TYPE="${TYPE_HEADER%%:*}"
+            HEADER="${TYPE_HEADER#*:}"
+            ITEMS=$(git log "$RANGE" --pretty=format:"%s" | grep -E "^${TYPE}(\(.*\))?:" | \
+              sed "s/^${TYPE}(\([^)]*\)): /- **\1:** /" | \
+              sed "s/^${TYPE}: /- /" || true)
+            if [ -n "$ITEMS" ]; then
+              NOTES="${NOTES}### ${HEADER}\n${ITEMS}\n\n"
+            fi
+          done
+          NOTES="${NOTES}Synchronized with [mirroir-mcp v${VERSION}](https://github.com/OllieKnight31/mirroir-mcp/releases/tag/v${VERSION}).\n\n"
+          if [ -n "$PREV_TAG" ]; then
+            NOTES="${NOTES}**Full Changelog**: https://github.com/jfarcand/mirroir-skills/compare/${PREV_TAG}...v${VERSION}"
+          fi
+
+          echo -e "$NOTES" > /tmp/skills-notes.md
+          gh release create "v${VERSION}" \
+            --repo jfarcand/mirroir-skills \
+            --title "v${VERSION}" \
+            --notes-file /tmp/skills-notes.md
+
+  publish-npm:
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: v${{ github.event.inputs.version }}
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Publish to npm (Trusted Publishing / OIDC)
+        working-directory: npm
+        run: npm publish --access public --provenance
+
+      # npm accepts a publish before the version is readable from the registry
+      # ("Your package is being processed"). publish-mcp-registry validates the
+      # version against npm, and push-version-to-main puts the plugin's pin on
+      # main, so this job must not succeed until npm serves it.
+      - name: Wait for npm to serve the published version
+        env:
+          VERSION: ${{ github.event.inputs.version }}
+        run: |
+          for attempt in $(seq 1 30); do
+            PUBLISHED=$(npm view "mirroir-mcp@$VERSION" version 2>/dev/null || true)
+            if [ "$PUBLISHED" = "$VERSION" ]; then
+              echo "npm serves mirroir-mcp@$VERSION (attempt $attempt)"
+              exit 0
+            fi
+            echo "attempt $attempt: npm does not serve $VERSION yet (latest: $(npm view mirroir-mcp version))"
+            sleep 20
+          done
+          echo "::error::npm never served mirroir-mcp@$VERSION within 10 minutes"
+          exit 1
+
+  # The bump commit reaches main only after publish-npm has seen npm serve the
+  # version, so main never pins a mirroir-mcp@<version> that npm cannot resolve.
+  # When main moved during the release, the tag is merged rather than
+  # fast-forwarded, which keeps the tag in main's history for the next
+  # release's changelog range.
+  push-version-to-main:
+    needs: [release, publish-npm]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          token: ${{ secrets.RELEASE_PAT }}
+          fetch-depth: 0
+
+      - name: Put the version bump on the default branch
+        env:
+          VERSION: ${{ github.event.inputs.version }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch origin "refs/tags/v$VERSION:refs/tags/v$VERSION"
+          if ! git merge --ff-only "v$VERSION"; then
+            git merge --no-ff -m "chore: bump version to $VERSION" "v$VERSION"
+          fi
+          git push origin "HEAD:$DEFAULT_BRANCH"
+
+  # Publish server.json to the official MCP Registry. Runs after publish-npm so
+  # the npm package referenced in server.json already exists when the registry
+  # validates it. Auth is GitHub OIDC: the server name lives in the
+  # io.github.jfarcand/* namespace, which `mcp-publisher login github-oidc`
+  # proves ownership of via the workflow's id-token — NO secret is required
+  # (per https://github.com/modelcontextprotocol/registry docs/modelcontextprotocol-io/github-actions.mdx).
+  publish-mcp-registry:
+    needs: [release, publish-npm]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write  # Required for OIDC authentication to the MCP Registry.
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: v${{ github.event.inputs.version }}
+
+      - name: Install mcp-publisher
+        run: |
+          curl -L "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_$(uname -s | tr '[:upper:]' '[:lower:]')_$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/').tar.gz" | tar xz mcp-publisher
+
+      - name: Authenticate to MCP Registry (GitHub OIDC)
+        run: ./mcp-publisher login github-oidc
+
+      - name: Publish server.json to MCP Registry
+        run: ./mcp-publisher publish

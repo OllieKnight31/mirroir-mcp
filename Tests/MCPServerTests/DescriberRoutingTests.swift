@@ -1,0 +1,416 @@
+/*
+ * Copyright 2026 Async-IO.org
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License"); you may not
+ * use this file except in compliance with the License. You may obtain a copy of
+ * the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ */
+// ABOUTME: Proves every server-internal screen check reads the local OCR describer, never the client's (vision) one.
+// ABOUTME: Counts describe calls on two stub describers across launch, back, reset, network, scroll, measure, compile, start and explore.
+
+import Foundation
+import HelperLib
+import XCTest
+@testable import mirroir_mcp
+
+final class DescriberRoutingTests: XCTestCase {
+
+    private let policy = PermissionPolicy(skipPermissions: true, config: nil)
+
+    private func screen(_ labels: String...) -> ScreenDescriber.DescribeResult {
+        ScreenDescriber.DescribeResult(
+            elements: labels.enumerated().map { index, label in
+                TapPoint(text: label, tapX: 200, tapY: 120 + Double(index) * 60, confidence: 0.9)
+            },
+            screenshotBase64: "img")
+    }
+
+    private func call(_ server: MCPServer, _ name: String, _ args: [String: JSONValue]) throws {
+        let request = JSONRPCRequest(
+            jsonrpc: "2.0", id: .number(1), method: "tools/call",
+            params: .object(["name": .string(name), "arguments": .object(args)])
+        )
+        _ = try XCTUnwrap(server.handleRequest(request))
+    }
+
+    /// A server with `register` applied to a registry whose client describer is
+    /// `client` and whose local OCR describer is `ocr`.
+    private func server(
+        client: StubDescriber, ocr: StubDescriber,
+        register: (MCPServer, TargetRegistry) -> Void
+    ) -> MCPServer {
+        let server = MCPServer(policy: policy, transport: .stdio)
+        let registry = makeTestRegistry(
+            bridge: StubBridge(), input: StubInput(), describer: client, ocrDescriber: ocr
+        )
+        register(server, registry)
+        return server
+    }
+
+    private func context(client: StubDescriber, ocr: StubDescriber) -> TargetContext {
+        makeTestRegistry(
+            bridge: StubBridge(), input: StubInput(), describer: client, ocrDescriber: ocr
+        ).activeTarget
+    }
+
+    // MARK: - Tools
+
+    func testLaunchAppConfirmsWithOCR() throws {
+        let client = StubDescriber()
+        let ocr = StubDescriber()
+        ocr.describeResult = screen("Favorites")
+        let server = server(client: client, ocr: ocr) { server, registry in
+            MirroirMCP.registerNavigationTools(server: server, registry: registry, policy: self.policy)
+        }
+
+        try call(server, "launch_app", ["name": .string("Safari")])
+
+        XCTAssertGreaterThan(ocr.describeCallCount, 0)
+        XCTAssertEqual(client.describeCallCount, 0, "launch confirmation must not use the vision describer")
+    }
+
+    func testPressBackLocatesTheChevronWithOCR() throws {
+        let client = StubDescriber()
+        let ocr = StubDescriber()
+        ocr.describeResult = screen("< Back")
+        let server = server(client: client, ocr: ocr) { server, registry in
+            MirroirMCP.registerNavigationTools(server: server, registry: registry, policy: self.policy)
+        }
+
+        try call(server, "press_back", [:])
+
+        XCTAssertEqual(ocr.describeCallCount, 2, "the screen is read before and after the back tap")
+        XCTAssertEqual(client.describeCallCount, 0, "press_back must not use the vision describer")
+    }
+
+    func testResetAppFindsTheSwitcherCardWithOCR() throws {
+        let client = StubDescriber()
+        let ocr = StubDescriber()
+        ocr.describeResult = screen("Notes")
+        let server = server(client: client, ocr: ocr) { server, registry in
+            MirroirMCP.registerAppManagementTools(server: server, registry: registry)
+        }
+
+        try call(server, "reset_app", ["name": .string("Notes")])
+
+        XCTAssertGreaterThan(ocr.describeCallCount, 0)
+        XCTAssertEqual(client.describeCallCount, 0, "reset_app must not use the vision describer")
+    }
+
+    func testSetNetworkFindsTheSettingsRowWithOCR() throws {
+        let client = StubDescriber()
+        let ocr = StubDescriber()
+        ocr.describeResult = screen("Wi-Fi")
+        let server = server(client: client, ocr: ocr) { server, registry in
+            MirroirMCP.registerNetworkTools(server: server, registry: registry,
+                                           policy: PermissionPolicy(skipPermissions: true, config: nil))
+        }
+
+        try call(server, "set_network", ["mode": .string("wifi_off")])
+
+        XCTAssertGreaterThan(ocr.describeCallCount, 0, "it reads the screen before and after the switch")
+        XCTAssertEqual(client.describeCallCount, 0, "set_network must not use the vision describer")
+    }
+
+    func testScrollToChecksVisibilityWithOCR() throws {
+        let client = StubDescriber()
+        let ocr = StubDescriber()
+        ocr.describeResult = screen("About")
+        let server = server(client: client, ocr: ocr) { server, registry in
+            MirroirMCP.registerScrollToTools(server: server, registry: registry)
+        }
+
+        try call(server, "scroll_to", ["label": .string("About")])
+
+        XCTAssertEqual(ocr.describeCallCount, 1)
+        XCTAssertEqual(client.describeCallCount, 0, "scroll_to must not use the vision describer")
+    }
+
+    func testMeasurePollsWithOCR() throws {
+        let client = StubDescriber()
+        let ocr = StubDescriber()
+        ocr.describeResult = screen("Go", "Done")
+        let server = server(client: client, ocr: ocr) { server, registry in
+            MirroirMCP.registerMeasureTools(server: server, registry: registry)
+        }
+
+        try call(server, "measure", ["action": .string("tap:Go"), "until": .string("Done")])
+
+        XCTAssertGreaterThanOrEqual(ocr.describeCallCount, 2, "action lookup + at least one poll")
+        XCTAssertEqual(client.describeCallCount, 0, "measure must not use the vision describer")
+    }
+
+    // MARK: - save_compiled
+
+    func testSaveCompiledFingerprintsWithOCR() throws {
+        let client = StubDescriber()
+        let ocr = StubDescriber()
+        ocr.describeResult = screen("General", "About")
+
+        let read = MirroirMCP.captureScreen(target: context(client: client, ocr: ocr))
+
+        XCTAssertNotNil(read?.fingerprint)
+        XCTAssertEqual(read?.elements.map(\.text), ["General", "About"])
+        XCTAssertEqual(ocr.describeCallCount, 1)
+        XCTAssertEqual(client.describeCallCount, 0, "the compile fingerprint must not use the vision describer")
+    }
+
+    // MARK: - Explore launch
+
+    func testLaunchAndWaitPollsOnlyWithOCR() {
+        let client = StubDescriber()
+        let ocr = StubDescriber()
+        // Spotlight still up on the first poll, then the app.
+        ocr.describeResults = [screen("Q Notes", "Notes"), screen("All iCloud", "New Folder", "Notes", "Shared", "Recently Deleted")]
+
+        let result = MirroirMCP.launchAndWait(appName: "Notes", ctx: context(client: client, ocr: ocr))
+
+        guard case .success = result else { return XCTFail("launch should succeed") }
+        XCTAssertGreaterThanOrEqual(ocr.describeCallCount, 1)
+        XCTAssertEqual(client.describeCallCount, 0, "launch bookkeeping must not use the vision describer")
+    }
+
+    func testLaunchAndWaitWaitsOutAColdBootSplash() {
+        let client = StubDescriber()
+        let ocr = StubDescriber()
+        // A game's cold boot: a black frame, then its logo, then the menu.
+        let menu = screen("MAGASIN", "BRAWLERS", "INFOS", "AMIS", "JOUER")
+        ocr.describeResults = [screen(), screen("U"), menu]
+
+        let result = MirroirMCP.launchAndWait(appName: "Brawl Stars", ctx: context(client: client, ocr: ocr))
+
+        guard case .success(let first) = result else { return XCTFail("launch should succeed") }
+        XCTAssertEqual(first.elements.map(\.text), menu.elements.map(\.text),
+                       "the first screen is the rendered menu, not a boot frame")
+        XCTAssertEqual(client.describeCallCount, 0)
+    }
+
+    func testLaunchAndWaitTakesASparseAppOnceTheWaitRunsOut() {
+        let client = StubDescriber()
+        let ocr = StubDescriber()
+        ocr.describeResult = screen("Empty")
+
+        let result = MirroirMCP.launchAndWait(
+            appName: "Empty", ctx: context(client: client, ocr: ocr), renderTimeoutMs: 1)
+
+        guard case .success(let first) = result else { return XCTFail("a sparse app still launches") }
+        XCTAssertEqual(first.elements.map(\.text), ["Empty"])
+    }
+
+    func testLaunchAndDescribeSpendsOneClientDescribe() {
+        let client = StubDescriber()
+        client.describeResult = screen("All iCloud", "New Folder", "Notes", "Shared", "Recently Deleted")
+        let ocr = StubDescriber()
+        ocr.describeResult = screen("All iCloud", "New Folder", "Notes", "Shared", "Recently Deleted")
+
+        let result = MirroirMCP.launchAndDescribe(appName: "Notes", ctx: context(client: client, ocr: ocr))
+
+        guard case .success = result else { return XCTFail("launch should succeed") }
+        XCTAssertGreaterThanOrEqual(ocr.describeCallCount, 1)
+        XCTAssertEqual(client.describeCallCount, 1, "only the first exploration screen uses the client describer")
+    }
+
+    func testLaunchInForegroundSpendsOneClientDescribe() {
+        let client = StubDescriber()
+        client.describeResult = screen("All iCloud", "New Folder", "Notes", "Shared", "Recently Deleted")
+        let ocr = StubDescriber()
+        ocr.describeResult = screen("All iCloud", "New Folder", "Notes", "Shared", "Recently Deleted")
+
+        let result = MirroirMCP.launchInForeground(
+            appName: "Notes", ctx: context(client: client, ocr: ocr))
+
+        guard case .success = result else { return XCTFail("launch should succeed") }
+        XCTAssertGreaterThanOrEqual(ocr.describeCallCount, 1)
+        XCTAssertEqual(client.describeCallCount, 1, "only the first exploration screen uses the client describer")
+    }
+
+    func testLaunchAndDescribeReportsAnUndescribableFirstScreen() {
+        let client = StubDescriber()
+        let ocr = StubDescriber()
+        ocr.describeResult = screen("All iCloud", "New Folder", "Notes", "Shared", "Recently Deleted")
+
+        let result = MirroirMCP.launchAndDescribe(appName: "Notes", ctx: context(client: client, ocr: ocr))
+
+        guard case .failure(.undescribable) = result else {
+            return XCTFail("a failed first describe must surface, not reuse the OCR screen")
+        }
+    }
+
+    // MARK: - describe_screen settle_ms
+
+    func testDescribeScreenForwardsSettleMs() throws {
+        let client = StubDescriber()
+        client.describeResult = screen("Play")
+        let ocr = StubDescriber()
+        let server = server(client: client, ocr: ocr) { server, registry in
+            MirroirMCP.registerScreenTools(server: server, registry: registry)
+        }
+
+        try call(server, "describe_screen", ["settle_ms": .number(0)])
+        XCTAssertEqual(client.lastSettleTimeoutUs, 0)
+
+        try call(server, "describe_screen", ["settle_ms": .number(250)])
+        XCTAssertEqual(client.lastSettleTimeoutUs, 250_000)
+
+        try call(server, "describe_screen", [:])
+        XCTAssertEqual(client.lastSettleTimeoutUs, EnvConfig.frameSettleTimeoutUs,
+            "a client describe settles by default in every describer mode")
+        XCTAssertEqual(ocr.describeCallCount, 0)
+    }
+
+    // MARK: - Already-foreground pre-check
+
+    /// Persist a one-node graph for `appName` whose node shows `labels`.
+    private func persistGraph(appName: String, labels: [String]) {
+        let node = ScreenNode(
+            fingerprint: "root",
+            elements: labels.map { TapPoint(text: $0, tapX: 200, tapY: 120, confidence: 0.9) },
+            icons: [], hints: [], depth: 0, screenType: .unknown, screenshotBase64: "",
+            visitedElements: [], navBarTitle: nil, isInfiniteScroll: false,
+            scrollExhausted: false, visualHash: nil
+        )
+        _ = GraphPersistence.save(snapshot: GraphSnapshot(
+            nodes: ["root": node], edges: [], adjacency: [:], rootFingerprint: "root",
+            deadEdges: [], recoveryEvents: []
+        ), bundleID: appName)
+    }
+
+    /// An app name no persisted graph or APP.md uses; its graph is removed on teardown.
+    private func uniqueApp() -> String {
+        let name = "RoutingTest-\(UUID().uuidString)"
+        addTeardownBlock { _ = GraphPersistence.delete(bundleID: name) }
+        return name
+    }
+
+    func testForegroundPreCheckReadsOCRAndDescribesOnceWithClient() {
+        let app = uniqueApp()
+        persistGraph(appName: app, labels: ["All iCloud", "New Folder", "Notes"])
+        let client = StubDescriber()
+        client.describeResult = screen("All iCloud", "New Folder", "Notes")
+        let ocr = StubDescriber()
+        ocr.describeResult = screen("All iCloud", "New Folder", "Notes")
+
+        let result = MirroirMCP.describeIfAlreadyForeground(
+            appName: app, ctx: context(client: client, ocr: ocr), logTag: "test")
+
+        guard case .success = result else { return XCTFail("a matching screen skips the launch") }
+        XCTAssertEqual(ocr.describeCallCount, 1)
+        XCTAssertEqual(client.describeCallCount, 1)
+    }
+
+    func testForegroundPreCheckWithoutGraphSpendsNoClientDescribe() {
+        let client = StubDescriber()
+        let ocr = StubDescriber()
+        ocr.describeResult = screen("Inbox")
+
+        XCTAssertNil(MirroirMCP.describeIfAlreadyForeground(
+            appName: uniqueApp(), ctx: context(client: client, ocr: ocr), logTag: "test"))
+        XCTAssertEqual(client.describeCallCount, 0)
+    }
+
+    /// generate_skill `start` for `app`, returning the input double to inspect launches.
+    private func start(app: String, client: StubDescriber, ocr: StubDescriber) -> StubInput {
+        let input = StubInput()
+        let registry = makeTestRegistry(
+            bridge: StubBridge(), input: input, describer: client, ocrDescriber: ocr)
+        _ = MirroirMCP.handleStart(
+            args: ["app_name": .string(app)], session: ExplorationSession(), registry: registry)
+        return input
+    }
+
+    func testStartLoadsTheAppMdIntoTheSession() throws {
+        let app = uniqueApp()
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("start-appmd-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let appDir = dir.appendingPathComponent("shop", isDirectory: true)
+        try FileManager.default.createDirectory(at: appDir, withIntermediateDirectories: true)
+        try "---\nversion: 1\napp: \(app)\n---\n\n## Structure\n\nA shop.\n\n## Landmarks\n- RESSOURCES\n"
+            .write(to: appDir.appendingPathComponent("APP.md"), atomically: true, encoding: .utf8)
+        let client = StubDescriber()
+        client.describeResult = screen("MAGASIN", "BRAWLERS", "INFOS", "AMIS", "JOUER")
+        let ocr = StubDescriber()
+        ocr.describeResult = client.describeResult
+        let session = ExplorationSession()
+        let registry = makeTestRegistry(
+            bridge: StubBridge(), input: StubInput(), describer: client, ocrDescriber: ocr)
+
+        _ = MirroirMCP.handleStart(
+            args: ["app_name": .string(app)], session: session, registry: registry,
+            appMdSearchPaths: [dir.path])
+
+        XCTAssertEqual(session.currentAppDescription?.landmarks, ["RESSOURCES"],
+                       "a manual session's SKILL.md must see the APP.md an explore sees")
+    }
+
+    func testColdStartSpendsOneClientDescribe() {
+        let client = StubDescriber()
+        client.describeResult = screen("Inbox", "Mailboxes", "Edit", "Updated Just Now", "Search")
+        let ocr = StubDescriber()
+        ocr.describeResult = screen("Inbox", "Mailboxes", "Edit", "Updated Just Now", "Search")
+
+        let input = start(app: uniqueApp(), client: client, ocr: ocr)
+
+        XCTAssertEqual(input.launchAppCalls.count, 1)
+        XCTAssertEqual(client.describeCallCount, 1, "pre-check and launch polls must read OCR")
+    }
+
+    func testWarmStartSkipsLaunchAndSpendsOneClientDescribe() {
+        let app = uniqueApp()
+        persistGraph(appName: app, labels: ["Inbox", "Mailboxes"])
+        let client = StubDescriber()
+        client.describeResult = screen("Inbox", "Mailboxes")
+        let ocr = StubDescriber()
+        ocr.describeResult = screen("Inbox", "Mailboxes")
+
+        let input = start(app: app, client: client, ocr: ocr)
+
+        XCTAssertTrue(input.launchAppCalls.isEmpty)
+        XCTAssertEqual(client.describeCallCount, 1)
+    }
+
+    /// generate_skill `explore` for `app`. The client describer returns nil, so
+    /// the handler stops right after its first-screen describe and never runs
+    /// the explorer, which is enough to count the describes the launch path spends.
+    private func exploreUntilFirstScreen(app: String, ocr: StubDescriber) -> (StubDescriber, StubInput) {
+        let client = StubDescriber()
+        let input = StubInput()
+        let registry = makeTestRegistry(
+            bridge: StubBridge(), input: input, describer: client, ocrDescriber: ocr)
+        let result = MirroirMCP.handleExplore(
+            args: ["app_name": .string(app)], session: ExplorationSession(),
+            registry: registry, server: MCPServer(policy: policy, transport: .stdio), policy: policy)
+        XCTAssertTrue(result.isError, "an undescribable first screen must abort the explore")
+        return (client, input)
+    }
+
+    func testColdExploreSpendsOneClientDescribe() {
+        let ocr = StubDescriber()
+        ocr.describeResult = screen("Inbox", "Mailboxes", "Edit", "Updated Just Now", "Search")
+
+        let (client, input) = exploreUntilFirstScreen(app: uniqueApp(), ocr: ocr)
+
+        XCTAssertEqual(input.launchAppCalls.count, 1)
+        XCTAssertEqual(client.describeCallCount, 1, "pre-check, launch polls and guard must read OCR")
+    }
+
+    func testWarmExploreSkipsLaunchAndSpendsOneClientDescribe() {
+        let app = uniqueApp()
+        persistGraph(appName: app, labels: ["Inbox", "Mailboxes"])
+        let ocr = StubDescriber()
+        ocr.describeResult = screen("Inbox", "Mailboxes")
+
+        let (client, input) = exploreUntilFirstScreen(app: app, ocr: ocr)
+
+        XCTAssertTrue(input.launchAppCalls.isEmpty)
+        XCTAssertEqual(client.describeCallCount, 1)
+    }
+}
